@@ -21,8 +21,8 @@ download.addEventListener('click', async () => {
     image.src = objectUrl;
     await image.decode();
     const canvas = document.createElement('canvas');
-    canvas.width = 1600;
-    canvas.height = 1000;
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
     const context = canvas.getContext('2d');
     if (!context) throw new Error('This browser cannot prepare the PNG.');
     context.drawImage(image, 0, 0);

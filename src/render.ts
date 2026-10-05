@@ -42,6 +42,44 @@ export function errorPage(status: number, message: string) {
 export function certificateSvg(license: License, origin: string) {
   const name = license.handle ? `@${license.handle}` : 'An informed anonymous bearer.';
   const url = `${origin}/license/${license.id}`;
-  // SVG is also the single source for the browser's high-resolution PNG export.
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000"><defs><linearGradient id="paper" x2="1" y2="1"><stop stop-color="#cbe8e9"/><stop offset=".32" stop-color="#f8f4dc"/><stop offset=".64" stop-color="#f1dbea"/><stop offset="1" stop-color="#c4d9f0"/></linearGradient><linearGradient id="foil" x2="1" y2="1"><stop stop-color="#74bdc7"/><stop offset=".4" stop-color="#ede9b6"/><stop offset=".65" stop-color="#eabdd9"/><stop offset="1" stop-color="#85afd6"/></linearGradient><pattern id="lines" width="22" height="22" patternUnits="userSpaceOnUse"><path d="M0 22L22 0" stroke="#142b40" stroke-opacity=".035"/></pattern></defs><rect width="1600" height="1000" rx="24" fill="url(#paper)"/><rect width="1600" height="1000" rx="24" fill="url(#lines)"/><rect x="22" y="22" width="1556" height="956" rx="16" stroke="#879cad" fill="none"/><g fill="#142b40"><g font-family="monospace" font-size="20" letter-spacing="3"><text x="80" y="98">BUREAU OF CONSCIOUSNESS LICENSING</text><text x="1510" y="98" text-anchor="end">CLASS C</text></g><path d="M80 130H1520" stroke="#9eafb9"/><text x="80" y="196" font-family="monospace" font-size="20" letter-spacing="4">CERTIFICATE OF MINIMUM FAMILIARITY</text><g font-family="Georgia,serif"><text x="76" y="325" font-size="112">Consciousness</text><text x="76" y="435" font-size="112">License</text><text x="80" y="534" font-size="52">${escape(name)}</text></g><text x="80" y="593" font-family="Arial,sans-serif" font-size="26">The bearer has demonstrated familiarity with the dispute.</text><path d="M80 639H1520" stroke="#9eafb9"/><g font-family="monospace"><text x="80" y="692" font-size="18" letter-spacing="2">EXAMINATION</text><text x="80" y="729" font-size="24">${escape(license.version)}</text><text x="535" y="692" font-size="18" letter-spacing="2">ISSUED (UTC)</text><text x="535" y="729" font-size="24">${escape(dateLabel(license.issuedAt))}</text><text x="80" y="786" font-size="19">RECORD ${escape(license.id)}</text></g><circle cx="1370" cy="714" r="88" fill="url(#foil)" stroke="#829a9d"/><circle cx="1370" cy="714" r="76" fill="none" stroke="#142b40" stroke-opacity=".35"/><text x="1370" y="733" text-anchor="middle" font-family="Georgia,serif" font-size="76">C</text><text x="1370" y="765" text-anchor="middle" font-family="monospace" font-size="18" letter-spacing="4">BCL</text><path d="M80 830H1520" stroke="#9eafb9"/><text x="80" y="874" font-family="monospace" font-size="18">DOES NOT CERTIFY THAT THE DISPUTE HAS BEEN RESOLVED. · ENTIRELY UNOFFICIAL</text><text x="80" y="922" font-family="monospace" font-size="${url.length > 95 ? '15' : '19'}">${escape(url)}</text><text x="80" y="955" font-family="Arial,sans-serif" font-size="16">Verify the database record at this URL. Handle self-declared; account ownership not verified.</text></g></svg>`;
+  const bureau = new URL(origin).host;
+  // Square artwork for single-photo phone feeds. Keep the title, bearer, joke,
+  // and bureau address legible at 320px; the full record URL is archival detail.
+  // This SVG is also the source for the browser's PNG export.
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1600" viewBox="0 0 1600 1600" role="img" aria-labelledby="certificate-title certificate-description">
+<title id="certificate-title">Consciousness License · ${escape(name)}</title>
+<desc id="certificate-description">Certifies familiarity with the dispute. Does not certify that the dispute has been resolved. An entirely unofficial license. Verify at ${escape(url)}.</desc>
+<defs>
+  <linearGradient id="paper" x2="1" y2="1"><stop stop-color="#cbe8e9"/><stop offset=".32" stop-color="#f8f4dc"/><stop offset=".64" stop-color="#f1dbea"/><stop offset="1" stop-color="#c4d9f0"/></linearGradient>
+  <linearGradient id="foil" x2="1" y2="1"><stop stop-color="#74bdc7"/><stop offset=".4" stop-color="#ede9b6"/><stop offset=".65" stop-color="#eabdd9"/><stop offset="1" stop-color="#85afd6"/></linearGradient>
+  <pattern id="lines" width="22" height="22" patternUnits="userSpaceOnUse"><path d="M0 22L22 0" stroke="#142b40" stroke-opacity=".035"/></pattern>
+</defs>
+<rect width="1600" height="1600" rx="32" fill="url(#paper)"/>
+<rect width="1600" height="1600" rx="32" fill="url(#lines)"/>
+<rect x="24" y="24" width="1552" height="1552" rx="20" stroke="#879cad" stroke-width="2" fill="none"/>
+<g fill="#142b40">
+  <g font-family="Arial,sans-serif" font-size="48" letter-spacing="3">
+    <text x="88" y="126">BUREAU OF</text><text x="88" y="188">CONSCIOUSNESS LICENSING</text>
+  </g>
+  <circle cx="1386" cy="151" r="94" fill="url(#foil)" stroke="#829a9d" stroke-width="2"/>
+  <circle cx="1386" cy="151" r="80" fill="none" stroke="#142b40" stroke-opacity=".35" stroke-width="2"/>
+  <text x="1386" y="176" text-anchor="middle" font-family="Georgia,serif" font-size="94">C</text>
+  <path d="M88 252H1512" stroke="#879cad" stroke-width="2"/>
+  <text x="88" y="322" font-family="Arial,sans-serif" font-size="36" letter-spacing="3">CERTIFICATE OF MINIMUM FAMILIARITY</text>
+  <g font-family="Georgia,serif" font-size="156">
+    <text x="80" y="496">Consciousness</text><text x="80" y="644">License</text>
+  </g>
+  <text x="88" y="774" font-family="Arial,sans-serif" font-size="${license.handle ? '88' : '78'}" font-weight="bold">${escape(name)}</text>
+  <path d="M88 838H1512" stroke="#879cad" stroke-width="2"/>
+  <g font-family="Arial,sans-serif" font-size="64">
+    <text x="88" y="942">Certifies familiarity with the dispute.</text>
+    <text x="88" y="1050">Does not certify that the dispute</text>
+    <text x="88" y="1128">has been resolved.</text>
+  </g>
+  <text x="88" y="1230" font-family="Arial,sans-serif" font-size="36">ISSUED ${escape(dateLabel(license.issuedAt))} (UTC) · ${escape(license.version)}</text>
+  <path d="M88 1282H1512" stroke="#879cad" stroke-width="2"/>
+  <a href="${escape(origin)}/"><text x="88" y="1390" font-family="Arial,sans-serif" font-size="${bureau.length > 32 ? '50' : '76'}" font-weight="bold">${escape(bureau)}</text></a>
+  <text x="88" y="1456" font-family="Arial,sans-serif" font-size="36" letter-spacing="2">ENTIRELY UNOFFICIAL · HANDLE SELF-DECLARED</text>
+  <a href="${escape(url)}"><text x="88" y="1530" font-family="monospace" font-size="${url.length > 95 ? '19' : '26'}">${escape(url)}</text></a>
+</g></svg>`;
 }

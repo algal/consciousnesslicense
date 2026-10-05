@@ -63,7 +63,8 @@ test('desktop launch, keyboard answers, reload, failure, retry, issuance, person
   const png = await readFile(testInfo.outputPath('license.png'));
   expect(png.subarray(1, 4).toString()).toBe('PNG');
   expect(png.readUInt32BE(16)).toBe(1600);
-  expect(png.readUInt32BE(20)).toBe(1000);
+  expect(png.readUInt32BE(20)).toBe(1600);
+  expect(png.length).toBeLessThan(5_000_000);
   expect(png.length).toBeGreaterThan(40000);
   const visitor = await browser.newContext();
   const publicPage = await visitor.newPage();

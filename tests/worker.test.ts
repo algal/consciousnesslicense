@@ -249,3 +249,28 @@ test('issued records and edit ownership survive an actual local database runtime
   assert.equal(restored.attempt.result.licenseId, result.licenseId);
   assert.equal((await call(`/api/licenses/${result.licenseId}`, { person, method: 'PATCH', data: { handle: 'AfterRestart' } })).status, 200);
 });
+
+test('production license URLs and SVG preserve the issued record on the chosen origin', async () => {
+  const person = client();
+  const attempt = await start(person);
+  const result = await (await grade(person, attempt)).json();
+  const publicOrigin = 'https://consciousnesslicense.com';
+  const url = `${publicOrigin}/license/${result.licenseId}`;
+  // Old examination data can expire without breaking a permanent public record.
+  await db.prepare('DELETE FROM attempts WHERE id = ?').bind(attempt.id).run();
+  const page = await worker.fetch(new Request(url), { DB: db });
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.ok(html.includes(`<link rel="canonical" href="${url}">`));
+  assert.ok(html.includes(`readonly value="${url}"`));
+  const image = await worker.fetch(new Request(`${url}/certificate.svg`), { DB: db });
+  assert.equal(image.status, 200);
+  assert.match(image.headers.get('Content-Type'), /image\/svg\+xml/);
+  const svg = await image.text();
+  assert.match(svg, /width="1600" height="1600"/);
+  assert.ok(svg.includes(`href="${publicOrigin}/"`));
+  assert.ok(svg.includes(`href="${url}"`));
+  assert.ok(svg.includes(url));
+  assert.match(svg, /consciousnesslicense\.com<\/text>/);
+  assert.doesNotMatch(svg, /localhost|127\.0\.0\.1|bureau\.test/);
+});
