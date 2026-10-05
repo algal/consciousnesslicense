@@ -49,6 +49,11 @@ test('desktop launch, keyboard answers, reload, failure, retry, issuance, person
   await expect(page.getByText('Issuance verified', { exact: false })).toBeVisible();
   await expect(page.locator('#personalization')).toBeVisible();
   await expect(page.locator('#license-name')).toHaveText('An informed anonymous bearer.');
+  const artwork = page.locator('.license-presentation svg');
+  await expect(artwork).toHaveAttribute('viewBox', '0 0 1600 1600');
+  await expect(artwork.locator('a[href="https://consciousnesslicense.com/"]')).toHaveText('consciousnesslicense.com');
+  await expect(artwork.locator(`a[href="${licenseUrl}"]`)).toHaveText(licenseUrl);
+  await expect(artwork).toContainText('CERTIFICATE OF BASIC FAMILIARITY');
   await page.getByLabel('X handle (self-declared)').fill('@Bureau_Test');
   await page.getByRole('button', { name: 'Save handle', exact: true }).click();
   await expect(page.locator('#license-name')).toHaveText('@Bureau_Test');

@@ -53,7 +53,7 @@ copy.addEventListener('click', async () => {
   catch { document.querySelector('#permanent-url').select(); status.textContent = 'Select and copy the permanent URL above.'; }
 });
 share.addEventListener('click', async () => {
-  try { await navigator.share({ title: 'Consciousness License', text: 'Certifies familiarity with the dispute. Does not certify that the dispute has been resolved.', url: permanentUrl }); }
+  try { await navigator.share({ title: 'Consciousness License', text: 'The Bureau hereby certifies that the bearer is competent to discuss the philosophy of consciousness.', url: permanentUrl }); }
   catch (error) { if (error.name !== 'AbortError') status.textContent = 'Sharing could not be opened. You can copy the URL instead.'; }
 });
 try {
@@ -74,7 +74,10 @@ document.querySelector('#handle-form').addEventListener('submit', async event =>
     const license = await response.json();
     if (!response.ok) throw new Error(license.error || 'The handle could not be saved.');
     input.value = license.handle ?? '';
-    document.querySelector('#license-name').textContent = license.handle ? `@${license.handle}` : 'An informed anonymous bearer.';
+    const name = license.handle ? `@${license.handle}` : 'An informed anonymous bearer.';
+    document.querySelector('#license-name').textContent = name;
+    document.querySelector('#license-name').setAttribute('font-size', license.handle ? '88' : '78');
+    document.querySelector('#certificate-title').textContent = `Consciousness License · ${name}`;
     document.title = `${license.handle ? `@${license.handle}` : 'An anonymous bearer'} · Consciousness License · Bureau of Consciousness Licensing`;
     message.textContent = license.handle ? 'Handle saved. Future downloads use your updated record.' : 'Your license is anonymous. Future downloads use your updated record.';
   } catch (error) { message.textContent = error.message; }
