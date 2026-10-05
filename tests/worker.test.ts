@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import worker, { cleanup } from '../src/worker.ts';
+import { pkceChallenge } from '../src/x-auth.ts';
 import { bank, createQuestions, topics } from '../src/content.ts';
 
 let mf, db, directory;
@@ -64,7 +65,7 @@ test('bank balances all 15 examined topics and every item has a source and four 
 test('examination establishes a secure, private browser capability', async () => {
   const response = await call('/exam', { headers: { Cookie: '' } });
   assert.equal(response.status, 200);
-  assert.match(response.headers.get('Set-Cookie'), /^__Host-bcl=[0-9a-f]{64}; Path=\/; HttpOnly; SameSite=Strict; Max-Age=31536000; Secure$/);
+  assert.match(response.headers.get('Set-Cookie'), /^__Host-bcl=[0-9a-f]{64}; Path=\/; HttpOnly; SameSite=Lax; Max-Age=31536000; Secure$/);
   assert.equal(response.headers.get('Cache-Control'), 'no-store');
   assert.match(response.headers.get('Content-Security-Policy'), /frame-ancestors 'none'/);
 });
@@ -92,7 +93,7 @@ test('12 passes, duplicate concurrent grades mint one persistent license, and sc
   const { count } = await db.prepare('SELECT count(*) AS count FROM licenses WHERE attempt_id = ?').bind(attempt.id).first();
   assert.equal(count, 1);
   const license = await (await call(`/api/licenses/${results[0].licenseId}`, { headers: { Cookie: '' } })).json();
-  assert.deepEqual(Object.keys(license).sort(), ['handle', 'id', 'issuedAt', 'version']);
+  assert.deepEqual(Object.keys(license).sort(), ['handle', 'id', 'issuedAt', 'version', 'xUserId', 'xVerifiedAt']);
   assert.equal(license.handle, null);
   const resumed = await (await call('/api/attempt', { person })).json();
   assert.deepEqual(resumed.attempt.result, results[0]);
@@ -140,26 +141,26 @@ test('duplicate starts, even after completion, are idempotent', async () => {
   assert.ok(recovered.result.passed);
 });
 
-test('only owner can edit; valid handles persist and duplicate handles are allowed', async () => {
+test('legacy handles stay unverified; only the owner may remove them and new handles require X', async () => {
   const alice = client(), bob = client();
-  const first = await start(alice), second = await start(bob);
-  const a = await (await grade(alice, first)).json(), b = await (await grade(bob, second)).json();
-  assert.equal((await call(`/api/licenses/${a.licenseId}`, { person: bob, method: 'PATCH', data: { handle: 'intruder' } })).status, 403);
+  const first = await start(alice);
+  const { licenseId: id } = await (await grade(alice, first)).json();
+  // An existing record from before the migration is never implicitly verified.
+  await db.prepare('UPDATE licenses SET handle = ? WHERE id = ?').bind('Legacy_handle', id).run();
+  assert.equal((await call(`/api/licenses/${id}`, { person: bob, method: 'PATCH', data: { handle: '' } })).status, 403);
   assert.equal((await call(`/api/attempts/${first.id}/submit`, { person: bob, method: 'POST', data: { answers: {} } })).status, 404);
-  for (const [person, result] of [[alice, a], [bob, b]]) {
-    const saved = await call(`/api/licenses/${result.licenseId}`, { person, method: 'PATCH', data: { handle: '@Same_handle' } });
-    assert.equal(saved.status, 200);
-    assert.equal((await saved.json()).handle, 'Same_handle');
-  }
-  const invalid = await call(`/api/licenses/${a.licenseId}`, { person: alice, method: 'PATCH', data: { handle: '<script>oops</script>' } });
-  assert.equal(invalid.status, 400);
-  assert.equal((await (await call(`/api/licenses/${a.licenseId}`)).json()).handle, 'Same_handle');
-  const svg = await (await call(`/license/${a.licenseId}/certificate.svg`)).text();
-  assert.match(svg, /@Same_handle/);
-  assert.ok(svg.includes(`${origin}/license/${a.licenseId}`));
-  assert.equal((await (await call(`/api/licenses/${a.licenseId}/editor`, { person: bob })).json()).canEdit, false);
-  assert.equal((await (await call(`/api/licenses/${a.licenseId}/editor`, { person: alice })).json()).canEdit, true);
-  const removed = await (await call(`/api/licenses/${a.licenseId}`, { person: alice, method: 'PATCH', data: { handle: '' } })).json();
+  assert.equal((await call(`/api/licenses/${id}`, { person: alice, method: 'PATCH', data: { handle: 'Invented' } })).status, 400);
+  const legacy = await (await call(`/api/licenses/${id}`)).json();
+  assert.equal(legacy.handle, 'Legacy_handle');
+  assert.equal(legacy.xVerifiedAt, null);
+  assert.equal(legacy.xUserId, null);
+  const svg = await (await call(`/license/${id}/certificate.svg`)).text();
+  assert.match(svg, /@Legacy_handle/);
+  assert.match(svg, /SELF-DECLARED · NOT X-VERIFIED/);
+  assert.ok(svg.includes(`${origin}/license/${id}`));
+  assert.equal((await (await call(`/api/licenses/${id}/editor`, { person: bob })).json()).canEdit, false);
+  assert.deepEqual(await (await call(`/api/licenses/${id}/editor`, { person: alice })).json(), { canEdit: true, xAvailable: false });
+  const removed = await (await call(`/api/licenses/${id}`, { person: alice, method: 'PATCH', data: { handle: '' } })).json();
   assert.equal(removed.handle, null);
 });
 
@@ -203,7 +204,7 @@ test('cleanup deletes temporary attempts and expired limits without deleting iss
   const state = await (await call('/api/attempt', { person })).json();
   assert.equal(state.attempt, null);
   assert.equal(state.recentLicense.id, result.licenseId);
-  assert.equal((await call(`/api/licenses/${result.licenseId}`, { person, method: 'PATCH', data: { handle: 'StillEditable' } })).status, 200);
+  assert.equal((await call(`/api/licenses/${result.licenseId}`, { person, method: 'PATCH', data: { handle: '' } })).status, 200);
 });
 
 test('missing records return 404; storage failures return retryable errors without exposing internals', async () => {
@@ -247,7 +248,7 @@ test('issued records and edit ownership survive an actual local database runtime
   assert.equal((await call(`/license/${result.licenseId}`)).status, 200);
   const restored = await (await call('/api/attempt', { person })).json();
   assert.equal(restored.attempt.result.licenseId, result.licenseId);
-  assert.equal((await call(`/api/licenses/${result.licenseId}`, { person, method: 'PATCH', data: { handle: 'AfterRestart' } })).status, 200);
+  assert.equal((await call(`/api/licenses/${result.licenseId}`, { person, method: 'PATCH', data: { handle: '' } })).status, 200);
 });
 
 test('production license URLs and SVG preserve the issued record on the chosen origin', async () => {
@@ -273,4 +274,165 @@ test('production license URLs and SVG preserve the issued record on the chosen o
   assert.ok(svg.includes(url));
   assert.match(svg, /consciousnesslicense\.com<\/text>/);
   assert.doesNotMatch(svg, /localhost|127\.0\.0\.1|bureau\.test/);
+});
+
+const xEnv = () => ({ DB: db, X_CLIENT_ID: 'test-client', X_CLIENT_SECRET: 'test-secret', X_CALLBACK_URL: `${origin}/auth/x/callback` });
+async function issued(person) {
+  return (await (await grade(person, await start(person))).json()).licenseId;
+}
+async function beginX(person, id) {
+  const response = await call(`/api/licenses/${id}/verify-x`, { person, method: 'POST', data: {}, env: xEnv() });
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.match(response.headers.get('Set-Cookie'), /SameSite=Lax/);
+  return new URL((await response.json()).url);
+}
+function finishX(person, auth, extra = 'code=test-code', options = {}) {
+  return call(`/auth/x/callback?state=${auth.searchParams.get('state')}&${extra}`, { person, env: xEnv(), ...options });
+}
+function mockX(t, username = 'Verified_User', id = '12345678') {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls.push({ url, init });
+    if (url === 'https://api.x.com/2/oauth2/revoke') return Response.json({ revoked: true });
+    if (url === 'https://api.x.com/2/oauth2/token') return Response.json({ access_token: 'temporary-test-token', token_type: 'bearer' });
+    assert.equal(url, 'https://api.x.com/2/users/me');
+    return Response.json({ data: { id, username } });
+  });
+  return calls;
+}
+
+test('PKCE matches the RFC 7636 S256 test vector', async () => {
+  assert.equal(await pkceChallenge('dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk'), 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM');
+});
+
+test('X starts require owner, same origin, configured callback and credentials', async () => {
+  const person = client(), id = await issued(person);
+  const path = `/api/licenses/${id}/verify-x`;
+  const options = { person, method: 'POST', data: {}, env: xEnv() };
+  assert.equal((await call(path, { ...options, person: client() })).status, 403);
+  assert.equal((await call(path, { ...options, headers: { Origin: 'https://attacker.test' } })).status, 403);
+  assert.equal((await call(path, { ...options, env: { DB: db } })).status, 503);
+  assert.equal((await call(path, { ...options, env: { ...xEnv(), X_CALLBACK_URL: 'https://attacker.test/auth/x/callback' } })).status, 503);
+  assert.equal((await call(path, { ...options, env: { ...xEnv(), X_CALLBACK_URL: `${origin}/auth/x/callback?extra=1` } })).status, 503);
+});
+
+test('OAuth verifies the server-provided identity once; PKCE, client auth and public certificate agree', async t => {
+  const person = client(), id = await issued(person);
+  const calls = mockX(t);
+  const auth = await beginX(person, id);
+  assert.equal(auth.origin, 'https://x.com');
+  assert.equal(auth.searchParams.get('scope'), 'tweet.read users.read');
+  assert.equal(auth.searchParams.get('code_challenge_method'), 'S256');
+  assert.equal(auth.searchParams.get('redirect_uri'), `${origin}/auth/x/callback`);
+  assert.equal(auth.searchParams.get('client_id'), 'test-client');
+  assert.ok(!auth.href.includes('test-secret'));
+  const saved = await db.prepare('SELECT * FROM x_oauth_states WHERE license_id = ?').bind(id).first();
+  assert.notEqual(saved.state_hash, auth.searchParams.get('state'));
+  assert.equal(await pkceChallenge(saved.verifier), auth.searchParams.get('code_challenge'));
+  assert.equal((await finishX(client(), auth)).status, 400);
+  assert.equal((await finishX(person, auth, 'code=test-code', { method: 'HEAD' })).status, 405);
+  assert.equal(calls.length, 0);
+  const responses = await Promise.all([finishX(person, auth), finishX(person, auth)]);
+  assert.deepEqual(responses.map(r => r.status).sort(), [303, 400]);
+  assert.equal(responses.find(r => r.status === 303).headers.get('Location'), `/license/${id}?x=verified`);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].url, 'https://api.x.com/2/oauth2/revoke');
+  assert.equal(calls[2].init.body.get('token'), 'temporary-test-token');
+  assert.equal(calls[2].init.body.get('token_type_hint'), 'access_token');
+  assert.equal(calls[2].init.headers.Authorization, `Basic ${btoa('test-client:test-secret')}`);
+  assert.ok(calls.every(c => c.init.redirect === 'manual'));
+  assert.equal(calls[0].init.headers.Authorization, `Basic ${btoa('test-client:test-secret')}`);
+  assert.equal(calls[0].init.method, 'POST');
+  assert.equal(calls[0].init.body.get('code_verifier'), saved.verifier);
+  assert.equal(calls[0].init.body.get('redirect_uri'), `${origin}/auth/x/callback`);
+  assert.equal(calls[1].init.headers.Authorization, 'Bearer temporary-test-token');
+  const publicRecord = await (await call(`/api/licenses/${id}`)).json();
+  assert.equal(publicRecord.handle, 'Verified_User');
+  assert.equal(publicRecord.xUserId, '12345678');
+  assert.ok(Date.parse(publicRecord.xVerifiedAt));
+  const page = await (await call(`/license/${id}`)).text();
+  assert.match(page, /X ACCOUNT VERIFIED/);
+  assert.match(page, /12345678/);
+  assert.doesNotMatch(page, /temporary-test-token|test-secret|owner_hash|code_verifier/);
+  assert.equal(await db.prepare('SELECT * FROM x_oauth_states WHERE license_id = ?').bind(id).first(), null);
+});
+
+test('expired, superseded and denied sign-ins never call X or alter a record', async t => {
+  const person = client(), id = await issued(person), calls = mockX(t);
+  const old = await beginX(person, id), auth = await beginX(person, id);
+  assert.equal((await finishX(person, old)).status, 400);
+  assert.match((await finishX(person, auth, 'error=access_denied&error_description=untrusted')).headers.get('Location'), /x=cancelled$/);
+  const expired = await beginX(person, id);
+  await db.prepare('UPDATE x_oauth_states SET expires_at = 0 WHERE license_id = ?').bind(id).run();
+  assert.equal((await finishX(person, expired)).status, 400);
+  assert.equal(calls.length, 0);
+  await cleanup(db);
+  assert.equal(await db.prepare('SELECT * FROM x_oauth_states WHERE license_id = ?').bind(id).first(), null);
+  assert.equal((await (await call(`/api/licenses/${id}`)).json()).handle, null);
+});
+
+test('provider failures and invalid profiles cannot confer verification or expose provider secrets', async t => {
+  const person = client(), id = await issued(person);
+  for (const mode of ['token-failure', 'profile-failure', 'bad-id', 'bad-handle', 'network']) {
+    t.mock.method(globalThis, 'fetch', async url => {
+      if (url.endsWith('/revoke')) return Response.json({ revoked: true });
+      if (mode === 'network') throw new Error('secret provider detail');
+      if (url.endsWith('/token')) return mode === 'token-failure' ? new Response('secret provider detail', { status: 401 }) : Response.json({ access_token: 'test', token_type: 'bearer' });
+      if (mode === 'profile-failure') return new Response('secret provider detail', { status: 402 });
+      return Response.json({ data: { id: mode === 'bad-id' ? 123 : '123', username: mode === 'bad-handle' ? '<script>' : 'Valid' } });
+    });
+    const auth = await beginX(person, id), response = await finishX(person, auth);
+    assert.match(response.headers.get('Location'), /x=x-(token|profile)$/);
+    assert.doesNotMatch(await response.text(), /secret provider detail/);
+    assert.equal((await (await call(`/api/licenses/${id}`)).json()).xUserId, null);
+    t.mock.restoreAll();
+  }
+});
+
+test('verified licenses allow same-account rename, reject transfers, and hide identity on removal', async t => {
+  const person = client(), id = await issued(person);
+  for (const [name, userId, outcome] of [['Original', '123', 'verified'], ['Renamed', '123', 'verified'], ['Different', '456', 'account-mismatch']]) {
+    mockX(t, name, userId);
+    const auth = await beginX(person, id);
+    assert.match((await finishX(person, auth)).headers.get('Location'), new RegExp(`x=${outcome}$`));
+    t.mock.restoreAll();
+  }
+  assert.equal((await (await call(`/api/licenses/${id}`)).json()).handle, 'Renamed');
+  const pending = await beginX(person, id);
+  const removed = await (await call(`/api/licenses/${id}`, { person, method: 'PATCH', data: { handle: '' } })).json();
+  assert.equal(removed.handle, null);
+  assert.equal(removed.xUserId, null);
+  assert.equal(removed.xVerifiedAt, null);
+  assert.equal((await finishX(person, pending)).status, 400);
+  assert.equal((await db.prepare('SELECT x_user_id FROM licenses WHERE id = ?').bind(id).first()).x_user_id, '123');
+  mockX(t, 'Different', '456');
+  assert.match((await finishX(person, await beginX(person, id))).headers.get('Location'), /x=account-mismatch$/);
+});
+
+test('removing a name while token exchange is in flight invalidates the callback', async t => {
+  const person = client(), id = await issued(person);
+  t.mock.method(globalThis, 'fetch', async url => {
+    if (url.endsWith('/revoke')) return Response.json({ revoked: true });
+    if (url.endsWith('/token')) {
+      assert.equal((await call(`/api/licenses/${id}`, { person, method: 'PATCH', data: { handle: '' } })).status, 200);
+      return Response.json({ access_token: 'test', token_type: 'bearer' });
+    }
+    return Response.json({ data: { id: '123', username: 'TooLate' } });
+  });
+  assert.match((await finishX(person, await beginX(person, id))).headers.get('Location'), /x=expired$/);
+  assert.equal((await (await call(`/api/licenses/${id}`)).json()).handle, null);
+});
+
+test('failure to revoke the temporary X token prevents verification', async t => {
+  const person = client(), id = await issued(person);
+  t.mock.method(globalThis, 'fetch', async url => {
+    if (url.endsWith('/token')) return Response.json({ access_token: 'test', token_type: 'bearer' });
+    if (url.endsWith('/revoke')) return new Response('secret response detail', { status: 503 });
+    return Response.json({ data: { id: '123', username: 'Verified' } });
+  });
+  const response = await finishX(person, await beginX(person, id));
+  assert.match(response.headers.get('Location'), /x=x-revoke$/);
+  const license = await (await call(`/api/licenses/${id}`)).json();
+  assert.equal(license.xVerifiedAt, null);
+  assert.equal(license.handle, null);
 });

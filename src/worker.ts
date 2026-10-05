@@ -1,14 +1,15 @@
+import { authorizationUrl, identifyXUser, randomToken, xConfigured, XUnavailable, type XConfig } from './x-auth.ts';
 import { createQuestions, EXAM_VERSION, PASS_MARK, publicQuestions, type Question } from './content.ts';
 import { about, certificateSvg, errorPage, exam, guide, home, licensePage, type License } from './render.ts';
 
-export interface Env { DB: D1Database; ASSETS: Fetcher }
+export interface Env extends XConfig { DB: D1Database; ASSETS: Fetcher; X_CALLBACK_URL?: string }
 type Attempt = { id: string; owner_hash: string; version: string; pass_mark: number; questions: string; result: string | null; created_at: number; touched_at: number };
-type LicenseRow = { id: string; handle: string | null; issued_at: string; version: string };
+type LicenseRow = { id: string; handle: string | null; issued_at: string; version: string; x_user_id: string | null; x_verified_at: string | null };
 type Result = { passed: boolean; score: number; total: number; passMark: number; licenseId: string | null; review: { prompt: string; selected: string; correct: string; explanation: string; topic: string; sources: Question['sources']; isCorrect: boolean }[] };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DAY = 86400;
 const now = () => Math.floor(Date.now() / 1000);
-const publicLicense = (l: LicenseRow): License => ({ id: l.id, handle: l.handle, issuedAt: l.issued_at, version: l.version });
+const publicLicense = (l: LicenseRow): License => ({ id: l.id, handle: l.handle, issuedAt: l.issued_at, version: l.version, xUserId: l.handle && l.x_verified_at ? l.x_user_id : null, xVerifiedAt: l.handle ? l.x_verified_at : null });
 class HttpError extends Error {
   status: number;
   retryAfter?: number;
@@ -28,7 +29,7 @@ function capability(request: Request) {
 }
 function setCapability(response: Response, request: Request) {
   const token = capability(request) ?? [...crypto.getRandomValues(new Uint8Array(32))].map(n => n.toString(16).padStart(2, '0')).join('');
-  response.headers.set('Set-Cookie', `${cookieName(request)}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
+  response.headers.set('Set-Cookie', `${cookieName(request)}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
   return response;
 }
 async function owner(request: Request) {
@@ -87,7 +88,7 @@ function attemptPayload(attempt: Attempt) {
 }
 async function findLicense(db: D1Database, id: string) {
   if (!UUID.test(id)) throw new HttpError(404, 'There is no issued license at this address. Check the complete URL.');
-  const license = await db.prepare('SELECT id, handle, issued_at, version FROM licenses WHERE id = ?').bind(id).first<LicenseRow>();
+  const license = await db.prepare('SELECT id, handle, issued_at, version, x_user_id, x_verified_at FROM licenses WHERE id = ?').bind(id).first<LicenseRow>();
   if (!license) throw new HttpError(404, 'There is no issued license at this address. Check the complete URL.');
   return publicLicense(license);
 }
@@ -122,17 +123,68 @@ async function submit(request: Request, env: Env, attempt: Attempt) {
   return json(JSON.parse(saved.result));
 }
 
+function callbackUrl(request: Request, env: Env): string | null {
+  // Explicit deployment configuration prevents arbitrary Host headers choosing a callback.
+  if (!xConfigured(env) || !env.X_CALLBACK_URL) return null;
+  try {
+    const configured = new URL(env.X_CALLBACK_URL);
+    if (configured.protocol !== 'https:' || configured.origin !== new URL(request.url).origin ||
+        configured.pathname !== '/auth/x/callback' || configured.search || configured.hash || configured.username || configured.password) return null;
+    return configured.href;
+  } catch { return null; }
+}
+type OAuthState = { license_id: string; verifier: string; redirect_uri: string; state_hash: string };
+const authRedirect = (id: string, outcome: string) => new Response(null, { status: 303, headers: { Location: `/license/${id}?x=${outcome}` } });
+async function xCallback(request: Request, env: Env): Promise<Response> {
+  const redirectUri = callbackUrl(request, env);
+  if (!redirectUri) throw new HttpError(503, 'X verification is not configured at this address. Your license remains available.');
+  const params = new URL(request.url).searchParams;
+  const state = params.get('state');
+  if (!state || !/^[0-9a-f]{64}$/.test(state) || params.getAll('state').length !== 1) throw new HttpError(400, 'This X sign-in is invalid. Return to your license and start again.');
+  const ownerHash = await owner(request);
+  // Atomic consumption: a callback is usable once, only by the initiating browser.
+  const saved = await env.DB.prepare(`DELETE FROM x_oauth_states
+    WHERE state_hash = ? AND owner_hash = ? AND redirect_uri = ? AND expires_at > ?
+    RETURNING license_id, verifier, redirect_uri, state_hash`).bind(await hash(state), ownerHash, redirectUri, now()).first<OAuthState>();
+  if (!saved) throw new HttpError(400, 'This X sign-in has expired or was already used. Return to your license and start again.');
+  if (params.has('error')) return authRedirect(saved.license_id, params.get('error') === 'access_denied' ? 'cancelled' : 'unavailable');
+  const code = params.get('code');
+  if (!code || code.length > 4096 || params.getAll('code').length !== 1) return authRedirect(saved.license_id, 'unavailable');
+  let identity;
+  try { identity = await identifyXUser(env, code, saved.verifier, saved.redirect_uri); }
+  catch (error) {
+    // Only fixed stage names and HTTP status codes are diagnostic output.
+    if (error instanceof XUnavailable) {
+      console.warn('BCL X verification failure', error.stage, error.status ?? 'network-or-response');
+      return authRedirect(saved.license_id, `x-${error.stage}`);
+    }
+    return authRedirect(saved.license_id, 'unavailable');
+  }
+  // The nonce also invalidates callbacks already in flight when a name is removed
+  // or a newer sign-in starts. The first verified account permanently binds the license.
+  const updated = await env.DB.prepare(`UPDATE licenses SET handle = ?, x_user_id = ?, x_verified_at = ?, x_auth_nonce = NULL
+    WHERE id = ? AND owner_hash = ? AND x_auth_nonce = ? AND (x_user_id IS NULL OR x_user_id = ?)
+    RETURNING id`).bind(identity.username, identity.id, new Date().toISOString(), saved.license_id, ownerHash, saved.state_hash, identity.id).first();
+  if (updated) return authRedirect(saved.license_id, 'verified');
+  const bound = await env.DB.prepare('SELECT x_user_id FROM licenses WHERE id = ? AND owner_hash = ?').bind(saved.license_id, ownerHash).first<{ x_user_id: string | null }>();
+  return authRedirect(saved.license_id, bound?.x_user_id && bound.x_user_id !== identity.id ? 'account-mismatch' : 'expired');
+}
+
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  if (path === '/auth/x/callback') {
+    if (method !== 'GET') throw new HttpError(405, 'X sign-in requires a browser redirect.');
+    return xCallback(request, env);
+  }
   if (method === 'GET' || method === 'HEAD') {
     if (path === '/') return html(home());
     if (path === '/guide') return html(guide());
     if (path === '/about') return html(about());
     if (path === '/exam') return setCapability(html(exam()), request);
     if (['/styles.css', '/exam.js', '/license.js', '/favicon.svg'].includes(path)) return env.ASSETS.fetch(request);
-    if (path === '/robots.txt') return new Response('User-agent: *\nDisallow: /api/\nDisallow: /exam\n', { headers: { 'Content-Type': 'text/plain' } });
+    if (path === '/robots.txt') return new Response('User-agent: *\nDisallow: /api/\nDisallow: /exam\nDisallow: /auth/\n', { headers: { 'Content-Type': 'text/plain' } });
     const record = path.match(/^\/license\/([^/]+)(\/certificate\.svg)?$/);
     if (record) {
       const license = await findLicense(env.DB, record[1]);
@@ -143,7 +195,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       const ownerHash = await owner(request);
       const attempt = await env.DB.prepare('SELECT * FROM attempts WHERE owner_hash = ? ORDER BY created_at DESC, rowid DESC LIMIT 1').bind(ownerHash).first<Attempt>();
       if (attempt && !attempt.result) await env.DB.prepare('UPDATE attempts SET touched_at = ? WHERE id = ? AND owner_hash = ?').bind(now(), attempt.id, ownerHash).run();
-      const recent = await env.DB.prepare('SELECT id, handle, issued_at, version FROM licenses WHERE owner_hash = ? ORDER BY issued_at DESC LIMIT 1').bind(ownerHash).first<LicenseRow>();
+      const recent = await env.DB.prepare('SELECT id, handle, issued_at, version, x_user_id, x_verified_at FROM licenses WHERE owner_hash = ? ORDER BY issued_at DESC LIMIT 1').bind(ownerHash).first<LicenseRow>();
       return json({ attempt: attempt ? attemptPayload(attempt) : null, recentLicense: recent ? publicLicense(recent) : null });
     }
     const apiLicense = path.match(/^\/api\/licenses\/([^/]+)(\/editor)?$/);
@@ -152,17 +204,37 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (!apiLicense[2]) return json(license);
       const token = capability(request);
       const owns = token ? await env.DB.prepare('SELECT id FROM licenses WHERE id = ? AND owner_hash = ?').bind(license.id, await hash(token)).first() : null;
-      return json({ canEdit: !!owns });
+      return json({ canEdit: !!owns, xAvailable: !!callbackUrl(request, env) });
     }
     throw new HttpError(404, 'The requested page or record is not on file.');
   }
   if (method !== 'POST' && method !== 'PATCH') throw new HttpError(405, 'That request method is not supported.');
   const isStart = path === '/api/attempts' && method === 'POST';
   const gradePath = path.match(/^\/api\/attempts\/([^/]+)\/submit$/);
+  const verifyPath = method === 'POST' && path.match(/^\/api\/licenses\/([^/]+)\/verify-x$/);
   const editPath = path.match(/^\/api\/licenses\/([^/]+)$/);
-  if (!(isStart || (gradePath && method === 'POST') || (editPath && method === 'PATCH'))) throw new HttpError(404, 'The requested action is not on file.');
+  if (!(isStart || verifyPath || (gradePath && method === 'POST') || (editPath && method === 'PATCH'))) throw new HttpError(404, 'The requested action is not on file.');
   const ownerHash = await owner(request);
   await guardMutation(request, env);
+  if (verifyPath) {
+    await readJson(request);
+    const redirectUri = callbackUrl(request, env);
+    if (!redirectUri) throw new HttpError(503, 'X sign-in is currently unavailable at this address. Your license remains available.');
+    const owns = await env.DB.prepare('SELECT id FROM licenses WHERE id = ? AND owner_hash = ?').bind(verifyPath[1], ownerHash).first();
+    if (!owns) throw new HttpError(403, 'This browser does not hold editing access to that license.');
+    await throttle(env.DB, `x-signin:${ownerHash}`, 10, 600);
+    await throttle(env.DB, 'all-x-signins', 1000, 3600);
+    const state = randomToken(), verifier = randomToken(), stateHash = await hash(state);
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM x_oauth_states WHERE owner_hash = ? OR expires_at <= ?').bind(ownerHash, now()),
+      env.DB.prepare('UPDATE licenses SET x_auth_nonce = NULL WHERE owner_hash = ? AND x_auth_nonce IS NOT NULL').bind(ownerHash),
+      env.DB.prepare('UPDATE licenses SET x_auth_nonce = ? WHERE id = ? AND owner_hash = ?').bind(stateHash, verifyPath[1], ownerHash),
+      env.DB.prepare('INSERT INTO x_oauth_states (state_hash, owner_hash, license_id, verifier, redirect_uri, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(stateHash, ownerHash, verifyPath[1], verifier, redirectUri, now() + 600),
+    ]);
+    // Upgrade older Strict cookies so the browser carries its capability back from X.
+    return setCapability(json({ url: await authorizationUrl(env, state, verifier, redirectUri) }), request);
+  }
   if (isStart) {
     const data = await readJson(request);
     // Stable request IDs let a delayed duplicate start recover its original attempt, even after grading.
@@ -184,10 +256,13 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
   if (editPath && method === 'PATCH') {
     const data = await readJson(request);
-    if (typeof data.handle !== 'string') throw new HttpError(400, 'Enter a handle, or an empty string to remain anonymous.');
-    const handle = data.handle.trim().replace(/^@/, '');
-    if (handle && !/^[A-Za-z0-9_]{1,15}$/.test(handle)) throw new HttpError(400, 'Use 1–15 letters, numbers, or underscores.');
-    const updated = await env.DB.prepare('UPDATE licenses SET handle = ? WHERE id = ? AND owner_hash = ? RETURNING id, handle, issued_at, version').bind(handle || null, editPath[1], ownerHash).first<LicenseRow>();
+    if (data.handle !== '') throw new HttpError(400, 'Sign in with X to add a verified handle. An empty handle removes the name.');
+    const result = await env.DB.batch([
+      env.DB.prepare('DELETE FROM x_oauth_states WHERE license_id = ? AND owner_hash = ?').bind(editPath[1], ownerHash),
+      env.DB.prepare(`UPDATE licenses SET handle = NULL, x_verified_at = NULL, x_auth_nonce = NULL
+        WHERE id = ? AND owner_hash = ? RETURNING id, handle, issued_at, version, x_user_id, x_verified_at`).bind(editPath[1], ownerHash),
+    ]);
+    const updated = result[1].results[0] as LicenseRow | undefined;
     if (!updated) throw new HttpError(403, 'This browser does not hold editing access to that license.');
     return json(publicLicense(updated));
   }
@@ -198,6 +273,7 @@ export async function cleanup(db: D1Database, stamp = now()) {
   await db.batch([
     db.prepare('DELETE FROM attempts WHERE result IS NOT NULL AND touched_at < ?').bind(stamp - 7 * DAY),
     db.prepare('DELETE FROM attempts WHERE result IS NULL AND touched_at < ?').bind(stamp - 30 * DAY),
+    db.prepare('DELETE FROM x_oauth_states WHERE expires_at <= ?').bind(stamp),
     db.prepare('DELETE FROM rate_limits WHERE expires_at < ?').bind(stamp),
   ]);
 }
@@ -217,7 +293,7 @@ export default {
     response = new Response(request.method === 'HEAD' ? null : response.body, response);
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('X-Content-Type-Options', 'nosniff');
-    response.headers.set('Referrer-Policy', 'same-origin');
+    response.headers.set('Referrer-Policy', 'no-referrer');
     response.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     response.headers.set('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
     return response;
