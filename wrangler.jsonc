@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "consciousness-license",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-04",
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  "d1_databases": [{
+    "binding": "DB", "database_name": "consciousness-license",
+    "database_id": "00000000-0000-0000-0000-000000000000",
+    "migrations_dir": "migrations"
+  }],
+  "triggers": { "crons": ["17 4 * * *"] },
+  "observability": { "enabled": false },
+  "env": {
+    "production": {
+      "name": "consciousness-license",
+      "account_id": "ddb33ac12515a20cc99956f7ca99daad",
+      "workers_dev": false,
+      "preview_urls": false,
+      "routes": [{ "pattern": "consciousnesslicense.com", "custom_domain": true }],
+      "d1_databases": [{
+        "binding": "DB", "database_name": "consciousness-license",
+        "database_id": "0aa7cb44-cf39-4d70-afda-5119ca01f4e7",
+        "migrations_dir": "migrations"
+      }]
+    }
+  }
+}

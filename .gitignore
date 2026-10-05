@@ -1,0 +1,22 @@
+node_modules/
+.wrangler/
+.dev.vars*
+.env*
+dist/
+test-results/
+playwright-report/
+*.log
+
+# Local handoff material and host-specific operations notes
+consciousness-handoff/
+consciousness-handoff.tar.gz
+LOCAL-NOTES.md
+
+# Credentials and database exports
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite*
+*.db
+*.db-*

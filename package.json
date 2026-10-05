@@ -1,0 +1,25 @@
+{
+  "name": "consciousness-license",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "wrangler dev --local --ip 127.0.0.1",
+    "db:migrate": "wrangler d1 migrations apply consciousness-license --local",
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "test:browser": "playwright test",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "deploy": "node scripts/check-deploy.mjs && wrangler deploy --env production"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261004.1",
+    "@playwright/test": "^1.63.0",
+    "miniflare": "^5.20261001.0-alpha",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.147.0"
+  }
+}
