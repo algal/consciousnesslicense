@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import worker, { cleanup } from '../src/worker.ts';
-import { pkceChallenge } from '../src/x-auth.ts';
+import { postId } from '../src/post-verification.ts';
 import { bank, createQuestions, topics } from '../src/content.ts';
 
 let mf, db, directory;
@@ -65,7 +65,7 @@ test('bank balances all 15 examined topics and every item has a source and four 
 test('examination establishes a secure, private browser capability', async () => {
   const response = await call('/exam', { headers: { Cookie: '' } });
   assert.equal(response.status, 200);
-  assert.match(response.headers.get('Set-Cookie'), /^__Host-bcl=[0-9a-f]{64}; Path=\/; HttpOnly; SameSite=Lax; Max-Age=31536000; Secure$/);
+  assert.match(response.headers.get('Set-Cookie'), /^__Host-bcl=[0-9a-f]{64}; Path=\/; HttpOnly; SameSite=Strict; Max-Age=31536000; Secure$/);
   assert.equal(response.headers.get('Cache-Control'), 'no-store');
   assert.match(response.headers.get('Content-Security-Policy'), /frame-ancestors 'none'/);
 });
@@ -93,7 +93,7 @@ test('12 passes, duplicate concurrent grades mint one persistent license, and sc
   const { count } = await db.prepare('SELECT count(*) AS count FROM licenses WHERE attempt_id = ?').bind(attempt.id).first();
   assert.equal(count, 1);
   const license = await (await call(`/api/licenses/${results[0].licenseId}`, { headers: { Cookie: '' } })).json();
-  assert.deepEqual(Object.keys(license).sort(), ['handle', 'id', 'issuedAt', 'version', 'xUserId', 'xVerifiedAt']);
+  assert.deepEqual(Object.keys(license).sort(), ['handle', 'id', 'issuedAt', 'verificationPostId', 'version', 'xUserId', 'xVerifiedAt']);
   assert.equal(license.handle, null);
   const resumed = await (await call('/api/attempt', { person })).json();
   assert.deepEqual(resumed.attempt.result, results[0]);
@@ -141,7 +141,7 @@ test('duplicate starts, even after completion, are idempotent', async () => {
   assert.ok(recovered.result.passed);
 });
 
-test('legacy handles stay unverified; only the owner may remove them and new handles require X', async () => {
+test('legacy handles stay unverified; only the owner may remove them and self-declarations never imply verification', async () => {
   const alice = client(), bob = client();
   const first = await start(alice);
   const { licenseId: id } = await (await grade(alice, first)).json();
@@ -149,7 +149,7 @@ test('legacy handles stay unverified; only the owner may remove them and new han
   await db.prepare('UPDATE licenses SET handle = ? WHERE id = ?').bind('Legacy_handle', id).run();
   assert.equal((await call(`/api/licenses/${id}`, { person: bob, method: 'PATCH', data: { handle: '' } })).status, 403);
   assert.equal((await call(`/api/attempts/${first.id}/submit`, { person: bob, method: 'POST', data: { answers: {} } })).status, 404);
-  assert.equal((await call(`/api/licenses/${id}`, { person: alice, method: 'PATCH', data: { handle: 'Invented' } })).status, 400);
+  assert.equal((await call(`/api/licenses/${id}`, { person: alice, method: 'PATCH', data: { handle: 'Legacy_handle' } })).status, 200);
   const legacy = await (await call(`/api/licenses/${id}`)).json();
   assert.equal(legacy.handle, 'Legacy_handle');
   assert.equal(legacy.xVerifiedAt, null);
@@ -159,7 +159,7 @@ test('legacy handles stay unverified; only the owner may remove them and new han
   assert.match(svg, /SELF-DECLARED · NOT X-VERIFIED/);
   assert.ok(svg.includes(`${origin}/license/${id}`));
   assert.equal((await (await call(`/api/licenses/${id}/editor`, { person: bob })).json()).canEdit, false);
-  assert.deepEqual(await (await call(`/api/licenses/${id}/editor`, { person: alice })).json(), { canEdit: true, xAvailable: false });
+  assert.deepEqual(await (await call(`/api/licenses/${id}/editor`, { person: alice })).json(), { canEdit: true, postAvailable: false, challenge: null });
   const removed = await (await call(`/api/licenses/${id}`, { person: alice, method: 'PATCH', data: { handle: '' } })).json();
   assert.equal(removed.handle, null);
 });
@@ -276,163 +276,182 @@ test('production license URLs and SVG preserve the issued record on the chosen o
   assert.doesNotMatch(svg, /localhost|127\.0\.0\.1|bureau\.test/);
 });
 
-const xEnv = () => ({ DB: db, X_CLIENT_ID: 'test-client', X_CLIENT_SECRET: 'test-secret', X_CALLBACK_URL: `${origin}/auth/x/callback` });
-async function issued(person) {
-  return (await (await grade(person, await start(person))).json()).licenseId;
-}
-async function beginX(person, id) {
-  const response = await call(`/api/licenses/${id}/verify-x`, { person, method: 'POST', data: {}, env: xEnv() });
+const postEnv = () => ({ DB: db, X_BEARER_TOKEN: 'test-app-token', X_DAILY_LOOKUP_LIMIT: '10000' });
+async function issued(person) { return (await (await grade(person, await start(person))).json()).licenseId; }
+async function prepare(person, id, handle = 'ProofUser') {
+  const response = await call(`/api/licenses/${id}/post-challenge`, { person, method: 'POST', data: { handle }, env: postEnv() });
   assert.equal(response.status, 200, await response.clone().text());
-  assert.match(response.headers.get('Set-Cookie'), /SameSite=Lax/);
-  return new URL((await response.json()).url);
+  return response.json();
 }
-function finishX(person, auth, extra = 'code=test-code', options = {}) {
-  return call(`/auth/x/callback?state=${auth.searchParams.get('state')}&${extra}`, { person, env: xEnv(), ...options });
+async function verify(person, id, challenge, post = '1234567890', env = postEnv()) {
+  return call(`/api/licenses/${id}/verify-post`, { person, method: 'POST', data: { nonce: challenge.nonce, url: `https://x.com/arbitrary/status/${post}` }, env });
 }
-function mockX(t, username = 'Verified_User', id = '12345678') {
-  const calls = [];
-  t.mock.method(globalThis, 'fetch', async (url, init) => {
-    calls.push({ url, init });
-    if (url === 'https://api.x.com/2/oauth2/revoke') return Response.json({ revoked: true });
-    if (url === 'https://api.x.com/2/oauth2/token') return Response.json({ access_token: 'temporary-test-token', token_type: 'bearer' });
-    assert.equal(url, 'https://api.x.com/2/users/me');
-    return Response.json({ data: { id, username } });
-  });
-  return calls;
+function proofResponse(challenge, id, options = {}) {
+  return { data: { id: options.postId ?? '1234567890', author_id: options.authorId ?? '777',
+    created_at: new Date((challenge.expiresAt - 1800 + 1) * 1000).toISOString(),
+    text: challenge.text.replace(`${origin}/license/${id}`, 'https://t.co/example'),
+    entities: { urls: [{ expanded_url: `${origin}/license/${id}` }] }, ...options.data },
+    includes: { users: [{ id: options.authorId ?? '777', username: challenge.handle, protected: false, ...options.user }] } };
 }
 
-test('PKCE matches the RFC 7636 S256 test vector', async () => {
-  assert.equal(await pkceChallenge('dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk'), 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM');
+test('post URLs accept normal X links but reject arbitrary hosts, credentials, paths, and fake IDs', () => {
+  for (const url of ['https://x.com/name/status/123?s=20', 'https://twitter.com/name/status/123', 'https://x.com/i/web/status/123', 'https://x.com/name/status/123/photo/1']) assert.equal(postId(url), '123');
+  for (const url of ['https://x.com.evil.test/name/status/123','http://x.com/name/status/123','https://x.com@evil.test/name/status/123','https://user@x.com/name/status/123','https://x.com/name/status/0','https://x.com/name/status/123/anything','https://localhost/123']) assert.equal(postId(url), null);
 });
 
-test('X starts require owner, same origin, configured callback and credentials', async () => {
+test('post preparation is private, owner-only, origin guarded, expiring, and replaces the internal request without changing the public post', async () => {
   const person = client(), id = await issued(person);
-  const path = `/api/licenses/${id}/verify-x`;
-  const options = { person, method: 'POST', data: {}, env: xEnv() };
-  assert.equal((await call(path, { ...options, person: client() })).status, 403);
-  assert.equal((await call(path, { ...options, headers: { Origin: 'https://attacker.test' } })).status, 403);
-  assert.equal((await call(path, { ...options, env: { DB: db } })).status, 503);
-  assert.equal((await call(path, { ...options, env: { ...xEnv(), X_CALLBACK_URL: 'https://attacker.test/auth/x/callback' } })).status, 503);
-  assert.equal((await call(path, { ...options, env: { ...xEnv(), X_CALLBACK_URL: `${origin}/auth/x/callback?extra=1` } })).status, 503);
-});
-
-test('OAuth verifies the server-provided identity once; PKCE, client auth and public certificate agree', async t => {
-  const person = client(), id = await issued(person);
-  const calls = mockX(t);
-  const auth = await beginX(person, id);
-  assert.equal(auth.origin, 'https://x.com');
-  assert.equal(auth.searchParams.get('scope'), 'tweet.read users.read');
-  assert.equal(auth.searchParams.get('code_challenge_method'), 'S256');
-  assert.equal(auth.searchParams.get('redirect_uri'), `${origin}/auth/x/callback`);
-  assert.equal(auth.searchParams.get('client_id'), 'test-client');
-  assert.ok(!auth.href.includes('test-secret'));
-  const saved = await db.prepare('SELECT * FROM x_oauth_states WHERE license_id = ?').bind(id).first();
-  assert.notEqual(saved.state_hash, auth.searchParams.get('state'));
-  assert.equal(await pkceChallenge(saved.verifier), auth.searchParams.get('code_challenge'));
-  assert.equal((await finishX(client(), auth)).status, 400);
-  assert.equal((await finishX(person, auth, 'code=test-code', { method: 'HEAD' })).status, 405);
-  assert.equal(calls.length, 0);
-  const responses = await Promise.all([finishX(person, auth), finishX(person, auth)]);
-  assert.deepEqual(responses.map(r => r.status).sort(), [303, 400]);
-  assert.equal(responses.find(r => r.status === 303).headers.get('Location'), `/license/${id}?x=verified`);
-  assert.equal(calls.length, 3);
-  assert.equal(calls[2].url, 'https://api.x.com/2/oauth2/revoke');
-  assert.equal(calls[2].init.body.get('token'), 'temporary-test-token');
-  assert.equal(calls[2].init.body.get('token_type_hint'), 'access_token');
-  assert.equal(calls[2].init.headers.Authorization, `Basic ${btoa('test-client:test-secret')}`);
-  assert.ok(calls.every(c => c.init.redirect === 'manual'));
-  assert.equal(calls[0].init.headers.Authorization, `Basic ${btoa('test-client:test-secret')}`);
-  assert.equal(calls[0].init.method, 'POST');
-  assert.equal(calls[0].init.body.get('code_verifier'), saved.verifier);
-  assert.equal(calls[0].init.body.get('redirect_uri'), `${origin}/auth/x/callback`);
-  assert.equal(calls[1].init.headers.Authorization, 'Bearer temporary-test-token');
-  const publicRecord = await (await call(`/api/licenses/${id}`)).json();
-  assert.equal(publicRecord.handle, 'Verified_User');
-  assert.equal(publicRecord.xUserId, '12345678');
-  assert.ok(Date.parse(publicRecord.xVerifiedAt));
-  const page = await (await call(`/license/${id}`)).text();
-  assert.match(page, /X ACCOUNT VERIFIED/);
-  assert.match(page, /12345678/);
-  assert.doesNotMatch(page, /temporary-test-token|test-secret|owner_hash|code_verifier/);
-  assert.equal(await db.prepare('SELECT * FROM x_oauth_states WHERE license_id = ?').bind(id).first(), null);
-});
-
-test('expired, superseded and denied sign-ins never call X or alter a record', async t => {
-  const person = client(), id = await issued(person), calls = mockX(t);
-  const old = await beginX(person, id), auth = await beginX(person, id);
-  assert.equal((await finishX(person, old)).status, 400);
-  assert.match((await finishX(person, auth, 'error=access_denied&error_description=untrusted')).headers.get('Location'), /x=cancelled$/);
-  const expired = await beginX(person, id);
-  await db.prepare('UPDATE x_oauth_states SET expires_at = 0 WHERE license_id = ?').bind(id).run();
-  assert.equal((await finishX(person, expired)).status, 400);
-  assert.equal(calls.length, 0);
+  const path = `/api/licenses/${id}/post-challenge`, opts = { person, method: 'POST', data: { handle: 'ProofUser' }, env: postEnv() };
+  assert.equal((await call(path, { ...opts, person: client() })).status, 403);
+  assert.equal((await call(path, { ...opts, headers: { Origin: 'https://evil.test' } })).status, 403);
+  assert.equal((await call(path, { ...opts, env: { DB: db } })).status, 503);
+  const first = await prepare(person, id), second = await prepare(person, id);
+  assert.notEqual(first.nonce, second.nonce);
+  assert.equal(second.text, `I have earned my Consciousness License.\n${origin}/license/${id}`);
+  assert.equal(first.text, second.text);
+  assert.ok(!second.text.includes(second.nonce));
+  assert.ok(second.text.includes(`${origin}/license/${id}`));
+  const visitor = await (await call(`/api/licenses/${id}/editor`, { env: postEnv() })).json();
+  assert.equal(visitor.challenge, null);
+  const ownerView = await (await call(`/api/licenses/${id}/editor`, { person, env: postEnv() })).json();
+  assert.equal(ownerView.challenge.nonce, second.nonce);
+  assert.doesNotMatch(await (await call(`/license/${id}`)).text(), new RegExp(second.nonce));
+  assert.equal((await verify(person, id, first)).status, 400);
+  await db.prepare('UPDATE post_challenges SET expires_at = 0 WHERE license_id = ?').bind(id).run();
+  assert.equal((await verify(person, id, second)).status, 400);
   await cleanup(db);
-  assert.equal(await db.prepare('SELECT * FROM x_oauth_states WHERE license_id = ?').bind(id).first(), null);
-  assert.equal((await (await call(`/api/licenses/${id}`)).json()).handle, null);
+  assert.equal(await db.prepare('SELECT license_id FROM post_challenges WHERE license_id = ?').bind(id).first(), null);
 });
 
-test('provider failures and invalid profiles cannot confer verification or expose provider secrets', async t => {
+test('one submitted post verifies the account and concurrent or repeated submissions do not pay twice', async t => {
   const person = client(), id = await issued(person);
-  for (const mode of ['token-failure', 'profile-failure', 'bad-id', 'bad-handle', 'network']) {
-    t.mock.method(globalThis, 'fetch', async url => {
-      if (url.endsWith('/revoke')) return Response.json({ revoked: true });
-      if (mode === 'network') throw new Error('secret provider detail');
-      if (url.endsWith('/token')) return mode === 'token-failure' ? new Response('secret provider detail', { status: 401 }) : Response.json({ access_token: 'test', token_type: 'bearer' });
-      if (mode === 'profile-failure') return new Response('secret provider detail', { status: 402 });
-      return Response.json({ data: { id: mode === 'bad-id' ? 123 : '123', username: mode === 'bad-handle' ? '<script>' : 'Valid' } });
-    });
-    const auth = await beginX(person, id), response = await finishX(person, auth);
-    assert.match(response.headers.get('Location'), /x=x-(token|profile)$/);
-    assert.doesNotMatch(await response.text(), /secret provider detail/);
-    assert.equal((await (await call(`/api/licenses/${id}`)).json()).xUserId, null);
-    t.mock.restoreAll();
-  }
-});
-
-test('verified licenses allow same-account rename, reject transfers, and hide identity on removal', async t => {
-  const person = client(), id = await issued(person);
-  for (const [name, userId, outcome] of [['Original', '123', 'verified'], ['Renamed', '123', 'verified'], ['Different', '456', 'account-mismatch']]) {
-    mockX(t, name, userId);
-    const auth = await beginX(person, id);
-    assert.match((await finishX(person, auth)).headers.get('Location'), new RegExp(`x=${outcome}$`));
-    t.mock.restoreAll();
-  }
-  assert.equal((await (await call(`/api/licenses/${id}`)).json()).handle, 'Renamed');
-  const pending = await beginX(person, id);
-  const removed = await (await call(`/api/licenses/${id}`, { person, method: 'PATCH', data: { handle: '' } })).json();
-  assert.equal(removed.handle, null);
-  assert.equal(removed.xUserId, null);
-  assert.equal(removed.xVerifiedAt, null);
-  assert.equal((await finishX(person, pending)).status, 400);
-  assert.equal((await db.prepare('SELECT x_user_id FROM licenses WHERE id = ?').bind(id).first()).x_user_id, '123');
-  mockX(t, 'Different', '456');
-  assert.match((await finishX(person, await beginX(person, id))).headers.get('Location'), /x=account-mismatch$/);
-});
-
-test('removing a name while token exchange is in flight invalidates the callback', async t => {
-  const person = client(), id = await issued(person);
-  t.mock.method(globalThis, 'fetch', async url => {
-    if (url.endsWith('/revoke')) return Response.json({ revoked: true });
-    if (url.endsWith('/token')) {
-      assert.equal((await call(`/api/licenses/${id}`, { person, method: 'PATCH', data: { handle: '' } })).status, 200);
-      return Response.json({ access_token: 'test', token_type: 'bearer' });
-    }
-    return Response.json({ data: { id: '123', username: 'TooLate' } });
+  await call(`/api/licenses/${id}`, { person, method: 'PATCH', data: { handle: 'ProofUser' } });
+  const before = await call(`/license/${id}`);
+  assert.match(await before.text(), /SELF-DECLARED · NOT X-VERIFIED/);
+  const challenge = await prepare(person, id);
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls++;
+    assert.equal(new URL(url).origin, 'https://api.x.com');
+    assert.equal(new URL(url).pathname, '/2/tweets/1234567890');
+    assert.equal(init.headers.Authorization, 'Bearer test-app-token');
+    assert.equal(init.redirect, 'manual');
+    await new Promise(resolve => setTimeout(resolve, 40));
+    return Response.json(proofResponse(challenge, id));
   });
-  assert.match((await finishX(person, await beginX(person, id))).headers.get('Location'), /x=expired$/);
-  assert.equal((await (await call(`/api/licenses/${id}`)).json()).handle, null);
-});
-
-test('failure to revoke the temporary X token prevents verification', async t => {
-  const person = client(), id = await issued(person);
-  t.mock.method(globalThis, 'fetch', async url => {
-    if (url.endsWith('/token')) return Response.json({ access_token: 'test', token_type: 'bearer' });
-    if (url.endsWith('/revoke')) return new Response('secret response detail', { status: 503 });
-    return Response.json({ data: { id: '123', username: 'Verified' } });
-  });
-  const response = await finishX(person, await beginX(person, id));
-  assert.match(response.headers.get('Location'), /x=x-revoke$/);
+  const replies = await Promise.all([verify(person, id, challenge), verify(person, id, challenge)]);
+  assert.ok(replies.some(reply => reply.status === 200));
+  assert.ok(replies.every(reply => [200,409].includes(reply.status)));
+  assert.equal(calls, 1);
+  assert.equal((await verify(person, id, challenge)).status, 200);
+  assert.equal(calls, 1);
   const license = await (await call(`/api/licenses/${id}`)).json();
-  assert.equal(license.xVerifiedAt, null);
-  assert.equal(license.handle, null);
+  assert.equal(license.handle, 'ProofUser');
+  assert.equal(license.xUserId, '777');
+  assert.equal(license.verificationPostId, '1234567890');
+  assert.ok(license.xVerifiedAt);
+  const html = await (await call(`/license/${id}`)).text();
+  assert.match(html, /X ACCOUNT VERIFIED/);
+  assert.ok(html.includes(`readonly value="${origin}/license/${id}"`));
+  const svg = await (await call(`/license/${id}/certificate.svg`)).text();
+  assert.match(svg, /X ACCOUNT VERIFIED/);
+  assert.ok(svg.includes(`${origin}/license/${id}`));
+  assert.ok(html.includes('https://x.com/i/status/1234567890'));
+  assert.doesNotMatch(html, /test-app-token/);
+  assert.equal((await call('/auth/x/callback?code=fake&state=fake')).status, 404);
+  assert.equal((await call(`/api/licenses/${id}/verify-x`, { person, method: 'POST', data: {} })).status, 404);
+});
+
+test('wrong author, old post, missing ownership statement, wrong URL, retweet, and protected account cannot verify', async t => {
+  for (const mode of ['author','old','future','statement','url','retweet','protected']) {
+    const person = client(), id = await issued(person), challenge = await prepare(person, id);
+    let calls = 0;
+    t.mock.method(globalThis, 'fetch', async () => {
+      calls++;
+      const response = proofResponse(challenge, id);
+      if (mode === 'author') response.includes.users[0].username = 'Impostor';
+      if (mode === 'old') response.data.created_at = '2000-01-01T00:00:00Z';
+      if (mode === 'future') response.data.created_at = new Date((challenge.expiresAt + 100) * 1000).toISOString();
+      if (mode === 'statement') response.data.text = response.data.text.replace('I have earned my Consciousness License.', 'Look at this license.');
+      if (mode === 'url') response.data.entities.urls[0].expanded_url += '/different';
+      if (mode === 'retweet') response.data.referenced_tweets = [{ type: 'retweeted', id: '999' }];
+      if (mode === 'protected') response.includes.users[0].protected = true;
+      return Response.json(response);
+    });
+    assert.equal((await verify(person, id, challenge)).status, 400, mode);
+    assert.equal((await (await call(`/api/licenses/${id}`)).json()).xVerifiedAt, null);
+    if (!['retweet','protected'].includes(mode)) {
+      assert.equal((await verify(person, id, challenge)).status, 400);
+      assert.equal(calls, 1, 'Invalid proof should be cached');
+    }
+    t.mock.restoreAll();
+  }
+});
+
+test('removal or a new challenge during a lookup invalidates the old proof', async t => {
+  for (const change of ['remove','replace']) {
+    const person = client(), id = await issued(person), challenge = await prepare(person, id);
+    t.mock.method(globalThis, 'fetch', async () => {
+      if (change === 'remove') await call(`/api/licenses/${id}`, { person, method: 'PATCH', data: { handle: '' } });
+      else await prepare(person, id);
+      return Response.json(proofResponse(challenge, id));
+    });
+    assert.equal((await verify(person, id, challenge)).status, 409);
+    assert.equal((await (await call(`/api/licenses/${id}`)).json()).xVerifiedAt, null);
+    t.mock.restoreAll();
+  }
+});
+
+test('previously verified identities survive migration, prevent transfers, and permit same-account refresh', async t => {
+  const person = client(), id = await issued(person);
+  await db.prepare('UPDATE licenses SET handle = ?, x_user_id = ?, x_verified_at = ? WHERE id = ?').bind('Original', '777', '2026-10-05T00:00:00Z', id).run();
+  assert.match(await (await call(`/license/${id}`)).text(), /X ACCOUNT VERIFIED/);
+  assert.equal((await call(`/api/licenses/${id}`, { person, method: 'PATCH', data: { handle: 'Invented' } })).status, 400);
+  assert.equal((await call(`/api/licenses/${id}`, { person, method: 'PATCH', data: { handle: '' } })).status, 200);
+  let challenge = await prepare(person, id, 'Renamed');
+  t.mock.method(globalThis, 'fetch', async () => Response.json(proofResponse(challenge, id, { authorId: '888' })));
+  assert.equal((await verify(person, id, challenge)).status, 400);
+  assert.equal((await (await call(`/api/licenses/${id}`)).json()).xUserId, null);
+  t.mock.restoreAll();
+  challenge = await prepare(person, id, 'Renamed');
+  t.mock.method(globalThis, 'fetch', async () => Response.json(proofResponse(challenge, id)));
+  assert.equal((await verify(person, id, challenge)).status, 200);
+  assert.equal((await (await call(`/api/licenses/${id}`)).json()).handle, 'Renamed');
+});
+
+test('daily paid-read cap rejects checks before network access; provider failures leave issuance untouched', async t => {
+  const person = client(), id = await issued(person), challenge = await prepare(person, id);
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('secret provider details', { status: 402 }); });
+  assert.equal((await verify(person, id, challenge, '1234567890', { ...postEnv(), X_DAILY_LOOKUP_LIMIT: '0' })).status, 429);
+  assert.equal(calls, 0);
+  const response = await verify(person, id, challenge);
+  assert.equal(response.status, 503);
+  assert.doesNotMatch(await response.text(), /secret provider details/);
+  assert.equal(calls, 1);
+  assert.equal((await (await call(`/api/licenses/${id}`)).json()).xVerifiedAt, null);
+});
+
+test('unauthorized and cross-origin verification submissions never call X', async t => {
+  const person = client(), id = await issued(person), challenge = await prepare(person, id);
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; throw new Error('must not call X'); });
+  assert.equal((await verify(client(), id, challenge)).status, 403);
+  assert.equal((await call(`/api/licenses/${id}/verify-post`, { person, method: 'POST', data: { nonce: challenge.nonce, url: 'https://x.com/name/status/123' }, env: postEnv(), headers: { Origin: 'https://evil.test' } })).status, 403);
+  assert.equal(calls, 0);
+});
+
+test('global paid-read reservation remains bounded under concurrent checks on different licenses', async t => {
+  const alice = client(), bob = client();
+  const first = await issued(alice), second = await issued(bob);
+  const a = await prepare(alice, first), b = await prepare(bob, second);
+  await db.prepare("DELETE FROM rate_limits WHERE key LIKE 'all-post-checks:%'").run();
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response(null, { status: 503 }); });
+  const replies = await Promise.all([
+    verify(alice, first, a, '1234567890', { ...postEnv(), X_DAILY_LOOKUP_LIMIT: '1' }),
+    verify(bob, second, b, '1234567891', { ...postEnv(), X_DAILY_LOOKUP_LIMIT: '1' }),
+  ]);
+  assert.deepEqual(replies.map(r => r.status).sort(), [429,503]);
+  assert.equal(calls, 1);
 });

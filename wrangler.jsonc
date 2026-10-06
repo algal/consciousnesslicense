@@ -9,14 +9,14 @@
     "database_id": "00000000-0000-0000-0000-000000000000",
     "migrations_dir": "migrations"
   }],
-  "vars": { "X_CALLBACK_URL": "https://consciousness.box.alexisgallagher.com/auth/x/callback" },
+  "vars": { "X_DAILY_LOOKUP_LIMIT": "100" },
   "triggers": { "crons": ["17 4 * * *"] },
   "observability": { "enabled": false },
   "env": {
     "production": {
       "name": "consciousness-license",
       "account_id": "ddb33ac12515a20cc99956f7ca99daad",
-      "vars": { "X_CALLBACK_URL": "https://consciousnesslicense.com/auth/x/callback" },
+      "vars": { "X_DAILY_LOOKUP_LIMIT": "100" },
       "workers_dev": false,
       "preview_urls": false,
       "routes": [{ "pattern": "consciousnesslicense.com", "custom_domain": true }],

@@ -24,7 +24,7 @@ If your environment restricts home-directory writes, set `WRANGLER_LOG_PATH=/tmp
 
 - Immediate examination, no signup: 15 questions, one from each of 15 topic groups in a 30-question bank. Four shuffled options each, 12 correct required, no countdown.
 - A sourced, position-neutral field guide covers the material. Results include explanations, guide anchors, and source links. Retries are allowed, subject to short abuse-control limits.
-- Passing issues an anonymous license immediately, with a short ceremony. Adding a handle requires X sign-in. Verified licenses publish the account ID, handle at verification, and verification date. A license can be refreshed using the same X account or made anonymous again; it cannot be transferred to another X account. Existing self-declared handles remain visibly unverified. Handles are not reserved.
+- Passing issues an anonymous license immediately, with a short ceremony. A handle may be self-declared. Verification requires publishing a prepared public X post and submitting its URL. Verified licenses publish the account ID, handle at verification, verification date, and proof-post link. A license can be refreshed with a new post from the same account or made anonymous again; it cannot be transferred to another account. Previously completed verifications remain valid. Handles are not reserved.
 - Permanent `/license/<random-id>` pages read D1 and include server-rendered sharing metadata. They do not expose scores, failed attempts, or ownership secrets.
 - Download a personalized 1600 × 1600 square PNG, copy the permanent URL, or use native sharing where supported. The browser rasterizes an authoritative server-rendered SVG; no image-generation or AI service runs at runtime.
 - The download is designed for a single-image phone feed: large title, bearer, certification, and bureau address, with the full permanent record URL retained below. Share the PNG together with the URL; a URL printed in an uploaded image is not a clickable link. The on-page certificate, home-page specimen, and download share the same SVG artwork.
@@ -45,29 +45,29 @@ The repository contains application source and schema migrations, not database c
 | --- | --- |
 | `src/content.ts` | Sourced guide, question bank, balanced selection and randomization |
 | `src/worker.ts` | Routing, server grading, issuance, authorization, limits, cleanup |
-| `src/x-auth.ts` | OAuth 2.0 PKCE, token exchange and X identity lookup |
+| `src/post-verification.ts` | Submitted-post URL parsing, app-only lookup and proof validation |
 | `src/render.ts` | Server-rendered pages, metadata, certificate SVG |
 | `public/exam.js` | Examination UI, draft answers, review, ceremony |
-| `public/license.js` | X verification entry point, name removal, PNG generation, sharing |
+| `public/license.js` | Self-declared handles, post preparation/submission, PNG generation, sharing |
 | `public/styles.css` | Adapted navy/paper visual draft, responsive styles, motion |
 | `migrations/` | D1 schema and versioned changes |
 | `tests/` | Real D1 integration tests and Chromium end-to-end tests |
 
-The Worker serves HTML directly and delegates four static assets to its asset binding. There is no framework server, hydration bundle, email, analytics, or runtime AI call. Optional X integration uses OAuth 2.0 authorization code flow with PKCE; OAuth 1.0 is not used.
+The Worker serves HTML directly and delegates four static assets to its asset binding. There is no framework server, hydration bundle, email, analytics, or runtime AI call. X verification uses app-only read access to the submitted public post and author. There is no user OAuth flow, timeline scanning, or background polling.
 
 ### Correctness and privacy
 
-An HttpOnly, SameSite=Lax capability cookie contains 256 random bits. HTTPS uses a Secure `__Host-` cookie. D1 stores only its SHA-256 hash. The cookie authorizes access to private attempts and personalization; the public license ID never authorizes editing. Clearing cookies loses editing access. X sign-in does not provide browser-session recovery. Lax allows the cookie to return on X’s top-level callback; other mutations require same-origin requests.
+An HttpOnly, SameSite=Strict capability cookie contains 256 random bits. HTTPS uses a Secure `__Host-` cookie. D1 stores only its SHA-256 hash. The cookie authorizes access to private attempts and personalization; the public license ID never authorizes editing. Clearing cookies loses editing access. A verification post does not provide browser-session recovery.
 
 Each attempt snapshots its private randomized questions, explanations, sources, threshold, and examination version. Its initial client payload omits answer keys and explanations. A submitted answer must reference an actual option in that attempt. A client-supplied pass flag has no effect.
 
 The first submission wins. A transactional D1 batch conditionally saves its result and inserts the license from that saved result; `UNIQUE(attempt_id)` additionally prevents duplicate issuance. If insertion fails, grading rolls back. Retransmission after a lost response returns the committed result. Different concurrent answers cannot replace it. Start requests use idempotency IDs and one pending attempt per browser owner.
 
-Exam, verification-start, and name-removal mutations require a same-origin JSON request, bounded to 16 KiB when consumed. All SQL values are bound parameters. HTML/SVG text is escaped and handles accept only 1–15 ASCII letters, digits, or underscores. API and record responses use `no-store`; CSP restricts scripts, forms, framing, and outbound requests. No application logs contain cookies, answers, handles, IPs, provider response bodies, or access tokens. The OAuth callback uses a single-use random state bound to the initiating browser and a ten-minute expiry. A private license nonce invalidates an in-flight callback after name removal or a newer sign-in. Verification uses the account returned by X; client-supplied usernames cannot confer verification.
+Exam, post preparation/submission, and handle-editing mutations require a same-origin JSON request, bounded to 16 KiB when consumed. All SQL values are bound parameters. HTML/SVG text is escaped and handles accept only 1–15 ASCII letters, digits, or underscores. API and record responses use `no-store`; CSP restricts scripts, forms, framing, and outbound requests. No application logs contain cookies, answers, handles, IPs, provider response bodies, or access tokens. Each private verification request records a declared handle, the exact license URL and a thirty-minute expiry. An internal random generation identifier prevents stale requests from updating the record; it is never included in the public post or certificate URL. The submitted post contains only the ownership statement and permanent license URL (including X’s expanded link entities), must be published within the request window, and must have a matching API-reported author. URL usernames are not trusted. Retweets and protected accounts are rejected. No arbitrary submitted URL is fetched: only a validated numeric post ID is sent to the fixed X API endpoint. Concurrent checks acquire a D1 lease before any paid API call; edits, replacement challenges or expiry invalidate in-flight results. Once verified, the stable account ID prevents transfer. Successful retries return the saved record without calling X. Failed proof comparisons are cached for that challenge; provider failures can be retried manually after a cooldown.
 
 Write limits: 120 mutations per client IP per ten minutes, 20 new attempts per browser owner per hour, and 2,000 new attempts globally per hour. Counts saturate at limit + 1. IPs are stored only as daily hashes, which are pseudonymous rather than anonymous. These limits control issuance/storage abuse, not distributed denial of service; Cloudflare account-level protections and quotas still apply. Tune thresholds in `src/worker.ts` for observed use.
 
-The daily 04:17 UTC scheduled handler removes completed attempts older than seven days, pending attempts not reopened for thirty days, expired rate-limit buckets, and expired OAuth transactions. The next daily run performs removal; licenses and their edit ownership persist. Local development does not run cron automatically. To exercise it locally:
+The daily 04:17 UTC scheduled handler removes completed attempts older than seven days, pending attempts not reopened for thirty days, expired rate-limit buckets, and expired post-verification challenges. The next daily run performs removal; licenses and their edit ownership persist. Local development does not run cron automatically. To exercise it locally:
 
 ```sh
 curl http://127.0.0.1:8787/cdn-cgi/local/scheduled
@@ -87,31 +87,43 @@ npm run build
 
 For an existing Chromium installation, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` (or its actual path) instead of installing a Playwright browser. Browser tests start a separate local Worker on port 8788 and use `.wrangler/browser-tests/`, not the preview database. They save screenshots and a downloaded PNG in `test-results/`. Both emulator tests and browser tests require local socket access.
 
-Integration tests cover the pass boundary, failure and retry, private data, forged pass flags, invalid inputs, duplicate/concurrent grading, ownership, OAuth state/PKCE, provider errors, account binding, concurrent callbacks, legacy handles, rollback on D1 errors, cleanup, persistence, rate limits, and missing records. Browser tests cover the complete user journey, keyboard selection, draft recovery, anonymous and verified-fixture PNG export, anonymous visitors, small screens, reduced motion, unavailable localStorage, and static content without JavaScript.
+Integration tests cover the pass boundary, failure and retry, private data, forged pass flags, invalid inputs, duplicate/concurrent grading, ownership, post-proof validation, provider errors, account binding, concurrent checks, paid-read limits, self-declared handles, rollback on D1 errors, cleanup, persistence, rate limits, and missing records. Browser tests cover the complete user journey, keyboard selection, draft recovery, anonymous and verified-fixture PNG export, anonymous visitors, small screens, reduced motion, unavailable localStorage, and static content without JavaScript.
 
 `npm run build` bundles the Worker and checks assets using Wrangler's deployment **dry run**. It does not publish anything. The lockfile pins tested dependencies; Miniflare is aligned with the runtime version used by Wrangler.
 
-## Optional X verification
+## Post-based X verification
 
-Configure a confidential Web App in the X developer console with read access and these exact callback URLs for this installation:
+This is the only new-verification flow. User OAuth routes and implementation have been removed. Migration `0004` preserves existing license URLs and verified accounts, removes transient OAuth data and adds expiring post challenges. Existing migrations stay immutable so both fresh installations and upgrades work.
 
-- `https://consciousnesslicense.com/auth/x/callback`
-- `https://consciousness.box.alexisgallagher.com/auth/x/callback`
+Use the X developer app’s **app-only Bearer Token**, not a personal OAuth access token. Add `X_BEARER_TOKEN=...` to ignored `.dev.vars`; `BEARER_TOKEN` is accepted for the existing local setup. The former OAuth client ID/secret and callback registration are no longer used. No credentials belong in the repository.
 
-For local development, put only the OAuth **2.0** `X_CLIENT_ID` and `X_CLIENT_SECRET` in ignored `.dev.vars`, using `KEY=VALUE` lines. No app-only bearer token, OAuth 1.0 Consumer Key, or pre-generated personal access token is needed. Never commit `.dev.vars`. `X_CALLBACK_URL` is a public configuration value in `wrangler.jsonc`, separate for preview and production. Sign-in is enabled only when the current HTTPS origin exactly matches that callback. Plain loopback still supports the exam and anonymous licenses; use the configured HTTPS preview to test X.
+1. Pass the exam and optionally save a self-declared handle.
+2. Prepare a verification post for that handle. This starts the verification window and produces “I have earned my Consciousness License.” followed by the permanent URL—no extra public code.
+3. Publish the complete text from a public account and paste that post’s URL back within thirty minutes. X’s intent page is a convenience; the user publishes the post themselves.
+4. The Worker fetches that single public post and its author. On success it updates the existing license at the same URL and records the proof post ID. No ongoing API reads occur when people view or download a license.
 
-The flow requests `tweet.read users.read` for X’s user-authenticated `/2/users/me` endpoint; X requires both permissions even for identity lookup: the consent screen therefore grants access to posts and accounts. This is a real grant, not merely misleading wording. The app calls neither the feed nor post endpoints. It does not request `offline.access` or retain access/refresh tokens. After obtaining an access token it requests revocation immediately after the identity lookup, including on lookup failure; verification is saved only after X acknowledges revocation. If revocation fails, the token is discarded and a visible failure message directs the user to X’s connected-app settings. It stores only the account ID, username and verification date in the license record, plus short-lived OAuth transaction state. Removing a name hides its account ID and verification date publicly but retains the ID privately to prevent transfer. Usernames are a snapshot; the stable account ID anchors verification if usernames change.
+The post must remain visible until checked. Subsequent deletion does not erase historical verification. Verification proves control of an account at that time, not who took the examination. Anonymous licenses remain available. Already verified account IDs remain bound even after name removal; a new post from the same account can refresh its handle.
 
-After local review, configure the production secrets interactively (never put their values in command-line arguments):
+### Cost controls
+
+X’s published pay-per-use rates are $0.005 per post and $0.010 per user resource. Budget **$0.015 per completed lookup** (one post plus its author), or about $15 per 1,000 checks. Failed proof checks that returned these resources also cost money. Confirm actual endpoint charges in the developer console; X may change rates. This implementation does not depend on X’s billing deduplication to limit requests.
+
+- At most three lookups per challenge, with a thirty-second cooldown between checks.
+- At most ten lookups per browser owner per UTC day, independent of challenge resets.
+- A global `X_DAILY_LOOKUP_LIMIT`, default **100 per UTC day** in `wrangler.jsonc`. This corresponds to roughly $1.50/day or $45/30 days of X resource reads at the above prices, if fully used. Setting it to zero disables paid lookups; malformed values fail closed.
+- Counters are reserved in D1 before external calls. In-flight checks are serialized; successful retries and cached failed proof comparisons make no external request. No automatic retries, polling, or timeline scans.
+
+Set an X account spending limit as the billing backstop. The application cap bounds this feature’s requests, not other apps sharing the X account or future pricing changes. Cloudflare usage remains subject to the Workers/D1 plan limits.
+
+After local review, install the production secret interactively, apply migrations and deploy:
 
 ```sh
-npx wrangler secret put X_CLIENT_ID --env production
-npx wrangler secret put X_CLIENT_SECRET --env production
+npx wrangler secret put X_BEARER_TOKEN --env production
 ```
 
-Apply the schema migration before deploying this code. Without these secrets the app still issues anonymous licenses, and X sign-in is visibly unavailable. A real end-to-end check requires the owner to follow **Verify with X** in the issuing browser and consent at X. Automated tests mock only the provider responses and do not prove the developer app’s callback registration or API entitlement. X API access and pricing are governed by the developer account’s current plan.
+If the bearer token is absent, verification is unavailable but the exam, anonymous licenses and self-declared handles still work. Tests mock the provider outside the actual Workers runtime and validate real D1 state transitions. The local app-only token has also been checked against one public post; final end-to-end testing requires the owner to publish a challenge post and submit its URL.
 
-References: [X OAuth 2.0 user access](https://docs.x.com/fundamentals/authentication/oauth-2-0/user-access-token), [X authentication mapping](https://docs.x.com/fundamentals/authentication/guides/v2-authentication-mapping).
+References: [X app-only authentication](https://docs.x.com/fundamentals/authentication/oauth-2-0/application-only), [post lookup](https://docs.x.com/x-api/posts/get-post-by-id), [X pricing](https://docs.x.com/x-api/getting-started/pricing).
 
 ## Cloudflare deployment
 
@@ -122,7 +134,7 @@ npx wrangler d1 migrations apply consciousness-license --remote --env production
 npm run deploy
 ```
 
-Authenticate using a locally configured `CLOUDFLARE_API_TOKEN` or `wrangler login`. Deployment requires access to Workers and D1, plus the domain permissions needed to configure the custom domain. Keep credentials outside the repository. D1 access uses the Worker binding. X verification additionally requires the two runtime secrets described below; the source remains safe to publish without them.
+Authenticate using a locally configured `CLOUDFLARE_API_TOKEN` or `wrangler login`. Deployment requires access to Workers and D1, plus the domain permissions needed to configure the custom domain. Keep credentials outside the repository. D1 access uses the Worker binding. Post verification additionally requires the app-only bearer token described above; the source remains safe to publish without them.
 
 For a separate installation, create a D1 database and replace the account, domain, and database ID under `env.production` in `wrangler.jsonc`:
 

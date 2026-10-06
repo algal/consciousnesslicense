@@ -1,15 +1,15 @@
-import { authorizationUrl, identifyXUser, randomToken, xConfigured, XUnavailable, type XConfig } from './x-auth.ts';
+import { bearerToken, fetchPost, matchesProof, postId, proofText, randomToken, PostUnavailable, type PostConfig } from './post-verification.ts';
 import { createQuestions, EXAM_VERSION, PASS_MARK, publicQuestions, type Question } from './content.ts';
 import { about, certificateSvg, errorPage, exam, guide, home, licensePage, type License } from './render.ts';
 
-export interface Env extends XConfig { DB: D1Database; ASSETS: Fetcher; X_CALLBACK_URL?: string }
+export interface Env extends PostConfig { DB: D1Database; ASSETS: Fetcher }
 type Attempt = { id: string; owner_hash: string; version: string; pass_mark: number; questions: string; result: string | null; created_at: number; touched_at: number };
-type LicenseRow = { id: string; handle: string | null; issued_at: string; version: string; x_user_id: string | null; x_verified_at: string | null };
+type LicenseRow = { id: string; handle: string | null; issued_at: string; version: string; x_user_id: string | null; x_verified_at: string | null; verification_post_id: string | null };
 type Result = { passed: boolean; score: number; total: number; passMark: number; licenseId: string | null; review: { prompt: string; selected: string; correct: string; explanation: string; topic: string; sources: Question['sources']; isCorrect: boolean }[] };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DAY = 86400;
 const now = () => Math.floor(Date.now() / 1000);
-const publicLicense = (l: LicenseRow): License => ({ id: l.id, handle: l.handle, issuedAt: l.issued_at, version: l.version, xUserId: l.handle && l.x_verified_at ? l.x_user_id : null, xVerifiedAt: l.handle ? l.x_verified_at : null });
+const publicLicense = (l: LicenseRow): License => ({ id: l.id, handle: l.handle, issuedAt: l.issued_at, version: l.version, xUserId: l.handle && l.x_verified_at ? l.x_user_id : null, xVerifiedAt: l.handle ? l.x_verified_at : null, verificationPostId: l.handle && l.x_verified_at ? l.verification_post_id : null });
 class HttpError extends Error {
   status: number;
   retryAfter?: number;
@@ -29,7 +29,7 @@ function capability(request: Request) {
 }
 function setCapability(response: Response, request: Request) {
   const token = capability(request) ?? [...crypto.getRandomValues(new Uint8Array(32))].map(n => n.toString(16).padStart(2, '0')).join('');
-  response.headers.set('Set-Cookie', `${cookieName(request)}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
+  response.headers.set('Set-Cookie', `${cookieName(request)}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
   return response;
 }
 async function owner(request: Request) {
@@ -88,7 +88,7 @@ function attemptPayload(attempt: Attempt) {
 }
 async function findLicense(db: D1Database, id: string) {
   if (!UUID.test(id)) throw new HttpError(404, 'There is no issued license at this address. Check the complete URL.');
-  const license = await db.prepare('SELECT id, handle, issued_at, version, x_user_id, x_verified_at FROM licenses WHERE id = ?').bind(id).first<LicenseRow>();
+  const license = await db.prepare('SELECT id, handle, issued_at, version, x_user_id, x_verified_at, verification_post_id FROM licenses WHERE id = ?').bind(id).first<LicenseRow>();
   if (!license) throw new HttpError(404, 'There is no issued license at this address. Check the complete URL.');
   return publicLicense(license);
 }
@@ -123,61 +123,68 @@ async function submit(request: Request, env: Env, attempt: Attempt) {
   return json(JSON.parse(saved.result));
 }
 
-function callbackUrl(request: Request, env: Env): string | null {
-  // Explicit deployment configuration prevents arbitrary Host headers choosing a callback.
-  if (!xConfigured(env) || !env.X_CALLBACK_URL) return null;
-  try {
-    const configured = new URL(env.X_CALLBACK_URL);
-    if (configured.protocol !== 'https:' || configured.origin !== new URL(request.url).origin ||
-        configured.pathname !== '/auth/x/callback' || configured.search || configured.hash || configured.username || configured.password) return null;
-    return configured.href;
-  } catch { return null; }
+type Challenge = { license_id: string; owner_hash: string; nonce: string; handle: string; record_url: string; created_at: number; expires_at: number; checks: number; claim_id: string | null; busy_until: number; last_post_id: string | null; last_error: string | null };
+const challengePayload = (c: Challenge) => ({ nonce: c.nonce, handle: c.handle, text: proofText(c.record_url), expiresAt: c.expires_at, checksRemaining: Math.max(0, 3 - c.checks) });
+function dailyLookupLimit(env: Env) {
+  const value = env.X_DAILY_LOOKUP_LIMIT ?? '100';
+  return /^[0-9]{1,6}$/.test(value) ? Math.min(Number(value), 100000) : 0;
 }
-type OAuthState = { license_id: string; verifier: string; redirect_uri: string; state_hash: string };
-const authRedirect = (id: string, outcome: string) => new Response(null, { status: 303, headers: { Location: `/license/${id}?x=${outcome}` } });
-async function xCallback(request: Request, env: Env): Promise<Response> {
-  const redirectUri = callbackUrl(request, env);
-  if (!redirectUri) throw new HttpError(503, 'X verification is not configured at this address. Your license remains available.');
-  const params = new URL(request.url).searchParams;
-  const state = params.get('state');
-  if (!state || !/^[0-9a-f]{64}$/.test(state) || params.getAll('state').length !== 1) throw new HttpError(400, 'This X sign-in is invalid. Return to your license and start again.');
-  const ownerHash = await owner(request);
-  // Atomic consumption: a callback is usable once, only by the initiating browser.
-  const saved = await env.DB.prepare(`DELETE FROM x_oauth_states
-    WHERE state_hash = ? AND owner_hash = ? AND redirect_uri = ? AND expires_at > ?
-    RETURNING license_id, verifier, redirect_uri, state_hash`).bind(await hash(state), ownerHash, redirectUri, now()).first<OAuthState>();
-  if (!saved) throw new HttpError(400, 'This X sign-in has expired or was already used. Return to your license and start again.');
-  if (params.has('error')) return authRedirect(saved.license_id, params.get('error') === 'access_denied' ? 'cancelled' : 'unavailable');
-  const code = params.get('code');
-  if (!code || code.length > 4096 || params.getAll('code').length !== 1) return authRedirect(saved.license_id, 'unavailable');
-  let identity;
-  try { identity = await identifyXUser(env, code, saved.verifier, saved.redirect_uri); }
-  catch (error) {
-    // Only fixed stage names and HTTP status codes are diagnostic output.
-    if (error instanceof XUnavailable) {
-      console.warn('BCL X verification failure', error.stage, error.status ?? 'network-or-response');
-      return authRedirect(saved.license_id, `x-${error.stage}`);
+async function verifyPost(request: Request, env: Env, id: string, ownerHash: string) {
+  const data = await readJson(request);
+  const post = postId(data.url);
+  if (!post) throw new HttpError(400, 'Paste the HTTPS URL of your published X post.');
+  const license = await env.DB.prepare('SELECT * FROM licenses WHERE id = ? AND owner_hash = ?').bind(id, ownerHash).first<LicenseRow>();
+  if (!license) throw new HttpError(403, 'This browser does not hold editing access to that license.');
+  // Lost-response retries of a successful verification cost nothing.
+  if (license.handle && license.x_verified_at && license.verification_post_id === post) return json(publicLicense(license));
+  if (!bearerToken(env)) throw new HttpError(503, 'Post verification is temporarily unavailable. Your license remains available.');
+  const challenge = await env.DB.prepare('SELECT * FROM post_challenges WHERE license_id = ? AND owner_hash = ?').bind(id, ownerHash).first<Challenge>();
+  if (!challenge || challenge.nonce !== data.nonce || challenge.expires_at <= now()) throw new HttpError(400, 'Prepare a new verification post; this request has expired or been replaced.');
+  if (challenge.last_post_id === post && challenge.last_error) throw new HttpError(400, challenge.last_error);
+  if (challenge.checks >= 3) throw new HttpError(429, 'This verification request has used its three checks. Prepare a new verification post.');
+  const claim = randomToken();
+  // Claim before calling X: simultaneous submissions cannot trigger duplicate paid reads.
+  const acquired = await env.DB.prepare(`UPDATE post_challenges SET claim_id = ?, busy_until = ?, checks = checks + 1
+    WHERE license_id = ? AND owner_hash = ? AND nonce = ? AND expires_at > ? AND busy_until <= ? AND checks < 3 RETURNING nonce`)
+    .bind(claim, now() + 60, id, ownerHash, challenge.nonce, now(), now()).first();
+  if (!acquired) throw new HttpError(409, 'A verification is already running or this request has changed. Please wait and reload.');
+  let paid = false;
+  try {
+    await throttle(env.DB, `post-checks:${ownerHash}`, 10, DAY);
+    await throttle(env.DB, 'all-post-checks', dailyLookupLimit(env), DAY);
+    paid = true;
+    const proof = await fetchPost(env, post);
+    if (!matchesProof(proof, challenge, now())) throw new HttpError(400, 'The post must be by the declared account, published within this request’s 30-minute window, and contain the complete prepared text. Publish a new post and submit its URL.');
+    if (license.x_user_id && license.x_user_id !== proof.authorId) throw new HttpError(400, 'This license is bound to another X account. Publish from the originally verified account.');
+    const updated = await env.DB.prepare(`UPDATE licenses SET handle = ?, x_user_id = ?, x_verified_at = ?, verification_post_id = ?
+      WHERE id = ? AND owner_hash = ? AND (x_user_id IS NULL OR x_user_id = ?)
+      AND EXISTS (SELECT 1 FROM post_challenges WHERE license_id = ? AND nonce = ? AND claim_id = ? AND expires_at > ?)
+      RETURNING id, handle, issued_at, version, x_user_id, x_verified_at, verification_post_id`)
+      .bind(proof.username, proof.authorId, new Date().toISOString(), post, id, ownerHash, proof.authorId, id, challenge.nonce, claim, now()).first<LicenseRow>();
+    if (!updated) throw new HttpError(409, 'Your license changed while verification was running. Reload to see its current record.');
+    await env.DB.prepare('DELETE FROM post_challenges WHERE license_id = ? AND claim_id = ?').bind(id, claim).run();
+    return json(publicLicense(updated));
+  } catch (error) {
+    // Cache failed proof checks so repeatedly submitting the same post is free.
+    // Provider failures may be retried manually after a short cooldown.
+    if (paid && error instanceof HttpError && error.status === 400) {
+      await env.DB.prepare('UPDATE post_challenges SET last_post_id = ?, last_error = ? WHERE license_id = ? AND claim_id = ?').bind(post, error.message, id, claim).run();
     }
-    return authRedirect(saved.license_id, 'unavailable');
+    if (error instanceof PostUnavailable) {
+      console.warn('BCL post lookup failure', error.status ?? 'network-or-response');
+      if ([403, 404, 422].includes(error.status ?? 0)) throw new HttpError(400, 'X could not supply that public, original post and its author. Check the URL and make sure the account is public.');
+      throw new HttpError(503, 'The Bureau could not retrieve the post from X. Please try again in a minute; your license has not changed.');
+    }
+    throw error;
+  } finally {
+    await env.DB.prepare('UPDATE post_challenges SET claim_id = NULL, busy_until = ? WHERE license_id = ? AND claim_id = ?').bind(paid ? now() + 30 : 0, id, claim).run();
   }
-  // The nonce also invalidates callbacks already in flight when a name is removed
-  // or a newer sign-in starts. The first verified account permanently binds the license.
-  const updated = await env.DB.prepare(`UPDATE licenses SET handle = ?, x_user_id = ?, x_verified_at = ?, x_auth_nonce = NULL
-    WHERE id = ? AND owner_hash = ? AND x_auth_nonce = ? AND (x_user_id IS NULL OR x_user_id = ?)
-    RETURNING id`).bind(identity.username, identity.id, new Date().toISOString(), saved.license_id, ownerHash, saved.state_hash, identity.id).first();
-  if (updated) return authRedirect(saved.license_id, 'verified');
-  const bound = await env.DB.prepare('SELECT x_user_id FROM licenses WHERE id = ? AND owner_hash = ?').bind(saved.license_id, ownerHash).first<{ x_user_id: string | null }>();
-  return authRedirect(saved.license_id, bound?.x_user_id && bound.x_user_id !== identity.id ? 'account-mismatch' : 'expired');
 }
 
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
-  if (path === '/auth/x/callback') {
-    if (method !== 'GET') throw new HttpError(405, 'X sign-in requires a browser redirect.');
-    return xCallback(request, env);
-  }
   if (method === 'GET' || method === 'HEAD') {
     if (path === '/') return html(home());
     if (path === '/guide') return html(guide());
@@ -195,7 +202,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       const ownerHash = await owner(request);
       const attempt = await env.DB.prepare('SELECT * FROM attempts WHERE owner_hash = ? ORDER BY created_at DESC, rowid DESC LIMIT 1').bind(ownerHash).first<Attempt>();
       if (attempt && !attempt.result) await env.DB.prepare('UPDATE attempts SET touched_at = ? WHERE id = ? AND owner_hash = ?').bind(now(), attempt.id, ownerHash).run();
-      const recent = await env.DB.prepare('SELECT id, handle, issued_at, version, x_user_id, x_verified_at FROM licenses WHERE owner_hash = ? ORDER BY issued_at DESC LIMIT 1').bind(ownerHash).first<LicenseRow>();
+      const recent = await env.DB.prepare('SELECT id, handle, issued_at, version, x_user_id, x_verified_at, verification_post_id FROM licenses WHERE owner_hash = ? ORDER BY issued_at DESC LIMIT 1').bind(ownerHash).first<LicenseRow>();
       return json({ attempt: attempt ? attemptPayload(attempt) : null, recentLicense: recent ? publicLicense(recent) : null });
     }
     const apiLicense = path.match(/^\/api\/licenses\/([^/]+)(\/editor)?$/);
@@ -204,36 +211,35 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (!apiLicense[2]) return json(license);
       const token = capability(request);
       const owns = token ? await env.DB.prepare('SELECT id FROM licenses WHERE id = ? AND owner_hash = ?').bind(license.id, await hash(token)).first() : null;
-      return json({ canEdit: !!owns, xAvailable: !!callbackUrl(request, env) });
+      const pending = owns ? await env.DB.prepare('SELECT * FROM post_challenges WHERE license_id = ? AND expires_at > ?').bind(license.id, now()).first<Challenge>() : null;
+      return json({ canEdit: !!owns, postAvailable: !!bearerToken(env), challenge: pending ? challengePayload(pending) : null });
     }
     throw new HttpError(404, 'The requested page or record is not on file.');
   }
   if (method !== 'POST' && method !== 'PATCH') throw new HttpError(405, 'That request method is not supported.');
   const isStart = path === '/api/attempts' && method === 'POST';
   const gradePath = path.match(/^\/api\/attempts\/([^/]+)\/submit$/);
-  const verifyPath = method === 'POST' && path.match(/^\/api\/licenses\/([^/]+)\/verify-x$/);
+  const verifyPath = method === 'POST' && path.match(/^\/api\/licenses\/([^/]+)\/verify-post$/);
+  const challengePath = method === 'POST' && path.match(/^\/api\/licenses\/([^/]+)\/post-challenge$/);
   const editPath = path.match(/^\/api\/licenses\/([^/]+)$/);
-  if (!(isStart || verifyPath || (gradePath && method === 'POST') || (editPath && method === 'PATCH'))) throw new HttpError(404, 'The requested action is not on file.');
+  if (!(isStart || verifyPath || challengePath || (gradePath && method === 'POST') || (editPath && method === 'PATCH'))) throw new HttpError(404, 'The requested action is not on file.');
   const ownerHash = await owner(request);
   await guardMutation(request, env);
-  if (verifyPath) {
-    await readJson(request);
-    const redirectUri = callbackUrl(request, env);
-    if (!redirectUri) throw new HttpError(503, 'X sign-in is currently unavailable at this address. Your license remains available.');
-    const owns = await env.DB.prepare('SELECT id FROM licenses WHERE id = ? AND owner_hash = ?').bind(verifyPath[1], ownerHash).first();
-    if (!owns) throw new HttpError(403, 'This browser does not hold editing access to that license.');
-    await throttle(env.DB, `x-signin:${ownerHash}`, 10, 600);
-    await throttle(env.DB, 'all-x-signins', 1000, 3600);
-    const state = randomToken(), verifier = randomToken(), stateHash = await hash(state);
-    await env.DB.batch([
-      env.DB.prepare('DELETE FROM x_oauth_states WHERE owner_hash = ? OR expires_at <= ?').bind(ownerHash, now()),
-      env.DB.prepare('UPDATE licenses SET x_auth_nonce = NULL WHERE owner_hash = ? AND x_auth_nonce IS NOT NULL').bind(ownerHash),
-      env.DB.prepare('UPDATE licenses SET x_auth_nonce = ? WHERE id = ? AND owner_hash = ?').bind(stateHash, verifyPath[1], ownerHash),
-      env.DB.prepare('INSERT INTO x_oauth_states (state_hash, owner_hash, license_id, verifier, redirect_uri, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .bind(stateHash, ownerHash, verifyPath[1], verifier, redirectUri, now() + 600),
-    ]);
-    // Upgrade older Strict cookies so the browser carries its capability back from X.
-    return setCapability(json({ url: await authorizationUrl(env, state, verifier, redirectUri) }), request);
+  if (verifyPath) return verifyPost(request, env, verifyPath[1], ownerHash);
+  if (challengePath) {
+    const data = await readJson(request);
+    const handle = typeof data.handle === 'string' ? data.handle.trim().replace(/^@/, '') : '';
+    if (!/^[A-Za-z0-9_]{1,15}$/.test(handle)) throw new HttpError(400, 'Enter an X handle: 1–15 letters, numbers, or underscores.');
+    const license = await env.DB.prepare('SELECT * FROM licenses WHERE id = ? AND owner_hash = ?').bind(challengePath[1], ownerHash).first<LicenseRow>();
+    if (!license) throw new HttpError(403, 'This browser does not hold editing access to that license.');
+    if (!bearerToken(env)) throw new HttpError(503, 'Post verification is temporarily unavailable.');
+    await throttle(env.DB, `post-preparations:${ownerHash}`, 10, 3600);
+    const pending = await env.DB.prepare(`INSERT INTO post_challenges (license_id, owner_hash, nonce, handle, record_url, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(license_id) DO UPDATE SET nonce = excluded.nonce, handle = excluded.handle,
+      record_url = excluded.record_url, created_at = excluded.created_at, expires_at = excluded.expires_at, checks = 0,
+      claim_id = NULL, busy_until = 0, last_post_id = NULL, last_error = NULL RETURNING *`)
+      .bind(challengePath[1], ownerHash, randomToken(), handle, `${url.origin}/license/${license.id}`, now(), now() + 1800).first<Challenge>();
+    return json(challengePayload(pending!));
   }
   if (isStart) {
     const data = await readJson(request);
@@ -256,11 +262,17 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
   if (editPath && method === 'PATCH') {
     const data = await readJson(request);
-    if (data.handle !== '') throw new HttpError(400, 'Sign in with X to add a verified handle. An empty handle removes the name.');
+    const handle = typeof data.handle === 'string' ? data.handle.trim().replace(/^@/, '') : null;
+    if (handle === null || (handle && !/^[A-Za-z0-9_]{1,15}$/.test(handle))) throw new HttpError(400, 'Enter 1–15 letters, numbers, or underscores, or leave blank for an anonymous license.');
+    // Once bound to a verified account, changing its handle needs a new proof.
+    const current = await env.DB.prepare('SELECT * FROM licenses WHERE id = ? AND owner_hash = ?').bind(editPath[1], ownerHash).first<LicenseRow>();
+    if (!current) throw new HttpError(403, 'This browser does not hold editing access to that license.');
+    if (current.x_user_id && handle) throw new HttpError(400, 'Verify a new post from the same account to refresh its handle, or leave the name blank.');
     const result = await env.DB.batch([
-      env.DB.prepare('DELETE FROM x_oauth_states WHERE license_id = ? AND owner_hash = ?').bind(editPath[1], ownerHash),
-      env.DB.prepare(`UPDATE licenses SET handle = NULL, x_verified_at = NULL, x_auth_nonce = NULL
-        WHERE id = ? AND owner_hash = ? RETURNING id, handle, issued_at, version, x_user_id, x_verified_at`).bind(editPath[1], ownerHash),
+      env.DB.prepare('DELETE FROM post_challenges WHERE license_id = ? AND owner_hash = ?').bind(editPath[1], ownerHash),
+      env.DB.prepare(`UPDATE licenses SET handle = ?, x_verified_at = NULL, verification_post_id = NULL
+        WHERE id = ? AND owner_hash = ? AND (? IS NULL OR x_user_id IS NULL)
+        RETURNING id, handle, issued_at, version, x_user_id, x_verified_at, verification_post_id`).bind(handle || null, editPath[1], ownerHash, handle || null),
     ]);
     const updated = result[1].results[0] as LicenseRow | undefined;
     if (!updated) throw new HttpError(403, 'This browser does not hold editing access to that license.');
@@ -273,7 +285,7 @@ export async function cleanup(db: D1Database, stamp = now()) {
   await db.batch([
     db.prepare('DELETE FROM attempts WHERE result IS NOT NULL AND touched_at < ?').bind(stamp - 7 * DAY),
     db.prepare('DELETE FROM attempts WHERE result IS NULL AND touched_at < ?').bind(stamp - 30 * DAY),
-    db.prepare('DELETE FROM x_oauth_states WHERE expires_at <= ?').bind(stamp),
+    db.prepare('DELETE FROM post_challenges WHERE expires_at <= ?').bind(stamp),
     db.prepare('DELETE FROM rate_limits WHERE expires_at < ?').bind(stamp),
   ]);
 }

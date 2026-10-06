@@ -55,15 +55,10 @@ test('desktop launch, keyboard answers, reload, failure, retry, issuance, person
   await expect(artwork.locator('a[href="https://consciousnesslicense.com/"]')).toHaveText('consciousnesslicense.com');
   await expect(artwork.locator(`a[href="${licenseUrl}"]`)).toHaveText(licenseUrl);
   await expect(artwork).toContainText('CERTIFICATE OF BASIC FAMILIARITY');
-  await expect(page.getByRole('button', { name: 'Verify with X' })).toBeDisabled();
-  await expect(page.locator('#handle-status')).toContainText('X sign-in is not available at this address');
-  // Loopback is deliberately not an OAuth callback host. Arbitrary handle edits are rejected.
-  const invented = await page.request.patch(`/api/licenses/${licenseUrl.split('/').pop()}`, {
-    headers: { Origin: 'http://127.0.0.1:8788' }, data: { handle: 'Bureau_Test' },
-  });
-  expect(invented.status()).toBe(400);
-  await page.reload();
-  await expect(page.locator('#license-name')).toHaveText('An informed anonymous bearer.');
+  await page.getByLabel('Self-declared X handle').fill('Bureau_Test');
+  await page.getByRole('button', { name: 'Save handle' }).click();
+  await expect(page.locator('#license-name')).toHaveText('@Bureau_Test');
+  await expect(artwork).toContainText('SELF-DECLARED · NOT X-VERIFIED');
   await page.screenshot({ path: testInfo.outputPath('license-desktop.png'), fullPage: true });
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Download license · PNG' }).click();
@@ -78,11 +73,13 @@ test('desktop launch, keyboard answers, reload, failure, retry, issuance, person
   const visitor = await browser.newContext();
   const publicPage = await visitor.newPage();
   await publicPage.goto(licenseUrl);
-  await expect(publicPage.locator('#license-name')).toHaveText('An informed anonymous bearer.');
+  await expect(publicPage.locator('#license-name')).toHaveText('@Bureau_Test');
   await expect(publicPage.locator('#personalization')).toBeHidden();
-  await expect(publicPage.locator('meta[property="og:title"]')).toHaveAttribute('content', /An anonymous bearer/);
+  await expect(publicPage.locator('meta[property="og:title"]')).toHaveAttribute('content', /@Bureau_Test/);
   await expect(publicPage.locator('body')).not.toContainText('15 of 15');
   await visitor.close();
+  await page.getByRole('button', { name: 'Remove name' }).click();
+  await expect(page.locator('#license-name')).toHaveText('An informed anonymous bearer.');
   expect(errors).toEqual([]);
 });
 
@@ -127,42 +124,55 @@ test('field guide and public-facing pages remain readable without JavaScript', a
   await context.close();
 });
 
-// Render verified fixtures through the real templates without a test-only production auth bypass.
-// Provider exchange and persistence are tested separately against D1 in worker.test.ts.
-test('verified mobile artwork, download, and removal UI use the authoritative record', async ({ page }, testInfo) => {
-  const origin = 'http://127.0.0.1:8788';
-  const id = '00000000-0000-4000-8000-000000000001';
-  let license = { id, handle: 'longest_handle_', issuedAt: '2026-10-05T00:00:00Z', version: 'C–01', xUserId: '123456789', xVerifiedAt: '2026-10-05T00:00:00Z' };
+// UI fixtures only; real Worker/D1 tests validate the proof and atomic update.
+test('post preparation, error recovery, verification at the same URL, mobile PNG and name removal', async ({ page }, testInfo) => {
+  const origin = 'http://127.0.0.1:8788', id = '00000000-0000-4000-8000-000000000001';
+  let license = { id, handle: 'longest_handle_', issuedAt: '2026-10-05T00:00:00Z', version: 'C–01', xUserId: null, xVerifiedAt: null, verificationPostId: null };
+  const proof = { nonce: 'a'.repeat(32), handle: license.handle, text: `I have earned my Consciousness License.\n${origin}/license/${id}`, expiresAt: Math.floor(Date.now()/1000)+1800, checksRemaining: 3 };
+  let challenge = null, failedOnce = false;
   await page.route(`**/license/${id}*`, route => route.fulfill({ contentType: 'text/html', body: licensePage(license, origin) }));
   await page.route(`**/license/${id}/certificate.svg`, route => route.fulfill({ contentType: 'image/svg+xml', body: certificateSvg(license, origin) }));
-  await page.route(`**/api/licenses/${id}/editor`, route => route.fulfill({ json: { canEdit: true, xAvailable: true } }));
-  await page.route(`**/api/licenses/${id}/verify-x`, route => route.fulfill({ status: 503, json: { error: 'X is temporarily unavailable. Please try again.' } }));
+  await page.route(`**/api/licenses/${id}/editor`, route => route.fulfill({ json: { canEdit: true, postAvailable: true, challenge } }));
+  await page.route(`**/api/licenses/${id}/post-challenge`, async route => { challenge = proof; await route.fulfill({ json: proof }); });
+  await page.route(`**/api/licenses/${id}/verify-post`, async route => {
+    expect(route.request().postDataJSON()).toEqual({ url: 'https://x.com/longest_handle_/status/123', nonce: proof.nonce });
+    if (!failedOnce) { failedOnce = true; await route.fulfill({ status: 503, json: { error: 'X is temporarily unavailable. Please try again.' } }); return; }
+    license = { ...license, xUserId: '123456789', xVerifiedAt: new Date().toISOString(), verificationPostId: '123' };
+    challenge = null;
+    await route.fulfill({ json: license });
+  });
   await page.route(`**/api/licenses/${id}`, async route => {
     expect(route.request().postDataJSON()).toEqual({ handle: '' });
-    license = { ...license, handle: null, xUserId: null, xVerifiedAt: null };
+    license = { ...license, handle: null, xUserId: null, xVerifiedAt: null, verificationPostId: null };
     await route.fulfill({ json: license });
   });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`/license/${id}`);
-  await expect(page.locator('#license-name')).toHaveText('@longest_handle_');
-  await expect(page.locator('.license-presentation svg')).toContainText('X ACCOUNT VERIFIED');
-  await expect(page.locator('.verification-notes')).toContainText('123456789');
-  await page.screenshot({ path: testInfo.outputPath('verified-mobile.png'), fullPage: true, animations: 'disabled' });
+  await page.getByRole('button', { name: 'Prepare verification post' }).click();
+  await expect(page.locator('#proof-text')).toHaveValue(proof.text);
+  const compose = new URL(await page.locator('#compose-post').getAttribute('href'));
+  expect(compose.origin).toBe('https://x.com');
+  expect(compose.searchParams.get('text')).toBe(proof.text);
+  expect(compose.searchParams.get('text')).not.toContain(proof.nonce);
+  expect(compose.searchParams.get('text')).not.toContain('BCL-');
+  await page.reload();
+  await expect(page.locator('#proof-text')).toHaveValue(proof.text);
   await page.setViewportSize({ width: 320, height: 640 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('post-verification-mobile.png'), fullPage: true, animations: 'disabled' });
+  await page.getByLabel('URL of your published post').fill('https://x.com/longest_handle_/status/123');
+  await page.getByRole('button', { name: 'Verify submitted post' }).click();
+  await expect(page.locator('#handle-status')).toContainText('X is temporarily unavailable');
+  await expect(page.locator('.license-presentation svg')).not.toContainText('X ACCOUNT VERIFIED');
+  await page.getByRole('button', { name: 'Verify submitted post' }).click();
+  await expect(page.locator('#auth-status')).toContainText('Your X account is verified');
+  expect(new URL(page.url()).pathname).toBe(`/license/${id}`);
+  await expect(page.locator('.license-presentation svg')).toContainText('X ACCOUNT VERIFIED');
+  await expect(page.getByRole('link', { name: 'View the verification post' })).toHaveAttribute('href', 'https://x.com/i/status/123');
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Download license · PNG' }).click();
   await (await downloadPromise).saveAs(testInfo.outputPath('verified-license.png'));
-  await page.getByRole('button', { name: 'Refresh X verification' }).click();
-  await expect(page.locator('#handle-status')).toContainText('X is temporarily unavailable');
-  await expect(page.getByRole('button', { name: 'Refresh X verification' })).toBeEnabled();
   await page.getByRole('button', { name: 'Remove name' }).click();
   await expect(page.locator('#license-name')).toHaveText('An informed anonymous bearer.');
-  await expect(page.locator('#auth-status')).toContainText('Your license is now anonymous');
   await expect(page.locator('.license-presentation svg')).not.toContainText('X ACCOUNT VERIFIED');
-  await page.goto(`/license/${id}?x=x-token`);
-  await expect(page.locator('#auth-status')).toBeInViewport();
-  await expect(page.locator('#auth-status')).toContainText('could not complete the token exchange');
-  await page.goto(`/license/${id}?x=verified`);
-  await expect(page.locator('#auth-status')).toContainText('No X verification is currently on file');
 });
