@@ -59,6 +59,17 @@ test('desktop launch, keyboard answers, reload, failure, retry, issuance, person
   await page.getByRole('button', { name: 'Save handle' }).click();
   await expect(page.locator('#license-name')).toHaveText('@Bureau_Test');
   await expect(artwork).toContainText('SELF-DECLARED · NOT X-VERIFIED');
+  // Exercise the actual WASM renderer in workerd.
+  const cardUrl = await page.locator('meta[property="og:image"]').getAttribute('content');
+  const cardResponse = await page.request.get(cardUrl!);
+  expect(cardResponse.status()).toBe(200);
+  expect(cardResponse.headers()['content-type']).toBe('image/png');
+  const cardPng = await cardResponse.body();
+  expect(cardPng.subarray(1, 4).toString()).toBe('PNG');
+  expect(cardPng.readUInt32BE(16)).toBe(1200);
+  expect(cardPng.readUInt32BE(20)).toBe(630);
+  expect(cardPng.length).toBeLessThan(5_000_000);
+  expect(await (await page.request.get(cardUrl!)).body()).toEqual(cardPng);
   await page.screenshot({ path: testInfo.outputPath('license-desktop.png'), fullPage: true });
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Download license · PNG' }).click();
@@ -75,11 +86,16 @@ test('desktop launch, keyboard answers, reload, failure, retry, issuance, person
   await publicPage.goto(licenseUrl);
   await expect(publicPage.locator('#license-name')).toHaveText('@Bureau_Test');
   await expect(publicPage.locator('#personalization')).toBeHidden();
+  expect((await publicPage.request.get(cardUrl!)).status()).toBe(200);
+  expect((await publicPage.request.head(cardUrl!)).headers()['content-type']).toBe('image/png');
+  expect((await publicPage.request.get('/license/00000000-0000-4000-8000-000000000000/social.png')).status()).toBe(404);
   await expect(publicPage.locator('meta[property="og:title"]')).toHaveAttribute('content', /@Bureau_Test/);
   await expect(publicPage.locator('body')).not.toContainText('15 of 15');
   await visitor.close();
   await page.getByRole('button', { name: 'Remove name' }).click();
   await expect(page.locator('#license-name')).toHaveText('An informed anonymous bearer.');
+  // An old image URL must not keep serving a removed handle from our edge cache.
+  expect(await (await page.request.get(cardUrl!)).body()).not.toEqual(cardPng);
   expect(errors).toEqual([]);
 });
 

@@ -10,3 +10,10 @@
 
 /* The on-page certificate and the download share the same SVG artwork. */
 .license-artwork{border-radius:12px;box-shadow:0 24px 55px #132b4020;overflow:hidden;line-height:0}.license-artwork.issued{padding:0}.license-artwork svg{display:block;width:100%;height:auto}.license-artwork a:focus-visible{outline-offset:4px}.license-presentation{max-width:660px}
+.social-preview { max-width: 900px; margin: 4rem auto; padding: 0 20px; }
+.social-preview h1 { font-size: clamp(2.4rem, 6vw, 4.5rem); }
+.social-card-preview { margin: 2rem 0; max-width: 680px; overflow: hidden; border: 1px solid #b9bec4; border-radius: 16px; background: #fff; }
+.social-card-preview img { display: block; width: 100%; height: auto; }
+.social-card-preview figcaption { padding: .8rem 1rem; font-family: Arial, sans-serif; line-height: 1.5; }
+.social-card-preview figcaption span, .social-card-preview figcaption strong { display: block; }
+.social-card-preview figcaption span { font-size: .8rem; color: #536471; }

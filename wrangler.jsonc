@@ -3,6 +3,7 @@
   "name": "consciousness-license",
   "main": "src/worker.ts",
   "compatibility_date": "2026-10-04",
+  "rules": [{ "type": "Data", "globs": ["**/*.ttf"], "fallthrough": true }],
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "d1_databases": [{
     "binding": "DB", "database_name": "consciousness-license",

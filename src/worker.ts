@@ -1,6 +1,7 @@
 import { bearerToken, fetchPost, matchesProof, postId, proofText, randomToken, PostUnavailable, type PostConfig } from './post-verification.ts';
 import { createQuestions, EXAM_VERSION, PASS_MARK, publicQuestions, type Question } from './content.ts';
 import { about, certificateSvg, errorPage, exam, guide, home, licensePage, type License } from './render.ts';
+import { CARD_VERSION, socialPreview } from './social-card.ts';
 
 export interface Env extends PostConfig { DB: D1Database; ASSETS: Fetcher }
 type Attempt = { id: string; owner_hash: string; version: string; pass_mark: number; questions: string; result: string | null; created_at: number; touched_at: number };
@@ -192,10 +193,27 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (path === '/exam') return setCapability(html(exam()), request);
     if (['/styles.css', '/exam.js', '/license.js', '/favicon.svg'].includes(path)) return env.ASSETS.fetch(request);
     if (path === '/robots.txt') return new Response('User-agent: *\nDisallow: /api/\nDisallow: /exam\nDisallow: /auth/\n', { headers: { 'Content-Type': 'text/plain' } });
-    const record = path.match(/^\/license\/([^/]+)(\/certificate\.svg)?$/);
+    const record = path.match(/^\/license\/([^/]+)(\/certificate\.svg|\/social\.png|\/social-preview)?$/);
     if (record) {
       const license = await findLicense(env.DB, record[1]);
-      if (record[2]) return new Response(certificateSvg(license, url.origin), { headers: { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Content-Disposition': `attachment; filename="consciousness-license-${license.id}.svg"` } });
+      if (record[2] === '/certificate.svg') return new Response(certificateSvg(license, url.origin), { headers: { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Content-Disposition': `attachment; filename="consciousness-license-${license.id}.svg"` } });
+      if (record[2] === '/social-preview') return html(socialPreview(license, url.origin));
+      if (record[2] === '/social.png') {
+        // Validate the current record before consulting the cache. Handle changes
+        // and removal select a new entry, even when a crawler uses an old URL.
+        const headers = { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=300' };
+        if (method === 'HEAD') return new Response(null, { headers });
+        const key = new Request(`${url.origin}/license/${license.id}/social.png?render=${CARD_VERSION}&name=${encodeURIComponent(license.handle ?? '')}`);
+        const cache = caches.default;
+        const cached = await cache.match(key);
+        if (cached) return new Response(cached.body, { headers });
+        const { renderSocialPng } = await import('./social-image.ts');
+        const bytes = await renderSocialPng(license);
+        const response = new Response(bytes as Uint8Array<ArrayBuffer>, { headers });
+        const stored = new Response(response.clone().body, { headers: { ...headers, 'Cache-Control': 'public, max-age=86400' } });
+        try { await cache.put(key, stored); } catch { /* Image remains usable if edge caching is unavailable. */ }
+        return response;
+      }
       return html(licensePage(license, url.origin));
     }
     if (path === '/api/attempt') {
@@ -303,7 +321,7 @@ export default {
       if (status === 405) response.headers.set('Allow', 'GET, HEAD, POST, PATCH');
     }
     response = new Response(request.method === 'HEAD' ? null : response.body, response);
-    response.headers.set('Cache-Control', 'no-store');
+    if (!response.headers.has('Cache-Control')) response.headers.set('Cache-Control', 'no-store');
     response.headers.set('X-Content-Type-Options', 'nosniff');
     response.headers.set('Referrer-Policy', 'no-referrer');
     response.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
